@@ -1,10 +1,16 @@
 # ==========================================================
-# MODULE:       Script_GodCleanup_v2.1.2 (Contract Compliant Edition)
+# MODULE:       Script_GodCleanup_v2.1.3 (Strict Compliance Edition)
 # PURPOSE:      檔案清理與去重自動化核心 (嚴格遵守 ACDS 合約)
 # EXPORTS:      Script_AppRouter.run()
 # IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
 # FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
-# VERSION:      2.1.2 [Stability: Stable]
+# DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
+# VERSION:      2.1.3 [Stability: Stable]
+#
+# [ADR-001] 關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
+# Context:  本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
+# Decision: 遭遇 Ctrl+C (KeyboardInterrupt) 時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
+# Rationale:在巨量檔案處理情境下，銷毀數小時的成功進度會造成極差的 UX。保留 Partial State 並透過 CSV 報表確保資料狀態具備完全的可稽核性，為此情境下之最佳實務。
 # ==========================================================
 
 import os
@@ -66,7 +72,6 @@ class cls_Strings:
 
 # =============================================================================
 # [UTILS] 基礎設施層：絕對隔離的 I/O 操作 (Infrastructure)
-# 合約：遵守第六章 Utils_ 前綴，純函數，無業務邏輯，回傳 bool
 # =============================================================================
 class Utils_Logger:
     @staticmethod
@@ -178,10 +183,8 @@ class Utils_FileSystem:
 
 # =============================================================================
 # [SCRIPT] 邏輯層：單一職責的業務管線 (Business Logic Pipelines)
-# 合約：遵守第六章 Script_ 前綴。必須接住 I/O 錯誤並透過 Logger 顯式廣播。
 # =============================================================================
 class Script_DryRun:
-    """職責：評估執行環境並返回評估報告數據"""
     def __init__(self, config: cls_AppConfig):
         self.config = config
 
@@ -203,7 +206,6 @@ class Script_DryRun:
         }
 
 class Script_Archiver:
-    """職責：Phase 1 - 將檔案搬入沙盒、算 Hash、歸檔與標記"""
     def __init__(self, config: cls_AppConfig, state: cls_AppState, src_dir: Path, dst_dir: Path):
         self.config = config
         self.state = state
@@ -223,13 +225,11 @@ class Script_Archiver:
             self.state.stats["total"] += 1
             temp_file = self.paths["temp"] / src_file.name
             
-            # 1. 複製至沙盒
             if not Utils_FileSystem.safe_copy(src_file, temp_file):
                 Utils_Logger.log("ERROR", "Script_Archiver", f"複製至沙盒失敗: {src_file.name}")
                 self._record_fail(src_file, "COPY_FAILED")
                 continue
 
-            # 2. 計算雜湊
             hash_val = Utils_FileSystem.calculate_sha256(temp_file, self.config.BUFFER_SIZE)
             if not hash_val:
                 Utils_Logger.log("ERROR", "Script_Archiver", f"Hash 計算失敗: {src_file.name}")
@@ -237,7 +237,6 @@ class Script_Archiver:
                 Utils_FileSystem.safe_unlink(temp_file)
                 continue
 
-            # 3. 判定分類與生成目標目錄
             is_unique = hash_val not in self.state.registry
             base_dir = self.paths["unique"] if is_unique else self.paths["dup"]
             status_tag = "UNIQUE" if is_unique else "DUP"
@@ -249,7 +248,6 @@ class Script_Archiver:
             except Exception:
                 target_dir = base_dir
 
-            # 4. 迴避撞名與移動
             clean_stem = Utils_FileSystem.sanitize_filename(src_file.stem)[:50]
             short_hash = hash_val[:self.config.HASH_LENGTH]
             marked_name = f"{short_hash}_{clean_stem}_{status_tag}{src_file.suffix}"
@@ -287,9 +285,12 @@ class Script_Archiver:
             pass
 
 class Script_Renamer:
-    """職責：Phase 2a - 剝離 Unique 區的印記"""
-    def __init__(self, unique_dir: Path):
+    def __init__(self, config: cls_AppConfig, unique_dir: Path):
+        self.config = config
         self.unique_dir = unique_dir
+        # [修復] 將匹配字元精準綁定 CONFIG.HASH_LENGTH，以 (\..*)? 防禦任何特殊後綴
+        # 即使原始檔名本身帶有 _UNIQUE 字樣，也不會被貪婪匹配錯殺
+        self.pattern = re.compile(rf'^([a-fA-F0-9]{{{self.config.HASH_LENGTH}}})_(.*)_UNIQUE(\..*)?$')
 
     def execute(self):
         Utils_Logger.log("INFO", "Script_Renamer", "啟動 Phase 2a: 印記剝離")
@@ -297,12 +298,12 @@ class Script_Renamer:
             current_dir = Path(root)
             for file in files:
                 old_path = current_dir / file
-                match = re.match(r'^[a-fA-F0-9]+_(.*)_UNIQUE(\.[a-zA-Z0-9]+)?$', file)
+                match = self.pattern.match(file)
                 if not match:
                     continue
                 
-                base_name = match.group(1)
-                ext = match.group(2) if match.group(2) else ""
+                base_name = match.group(2)
+                ext = match.group(3) if match.group(3) else ""
                 new_path = current_dir / f"{base_name}{ext}"
 
                 if Utils_FileSystem.exists(new_path) and new_path != old_path:
@@ -321,7 +322,6 @@ class Script_Renamer:
             counter += 1
 
 class Script_Flattener:
-    """職責：Phase 2b - 稀疏目錄隧道坍塌"""
     def __init__(self, config: cls_AppConfig, unique_dir: Path):
         self.config = config
         self.unique_dir = unique_dir
@@ -359,7 +359,6 @@ class Script_Flattener:
             counter += 1
 
 class Script_Reporter:
-    """職責：生成總結算報表與清理暫存"""
     @staticmethod
     def finalize(config: cls_AppConfig, state: cls_AppState, dst_dir: Path):
         temp_dir = dst_dir / config.DIR_TEMP
@@ -392,7 +391,7 @@ class Script_AppRouter:
     def run(self):
         Utils_Logger.log("INFO", "AppRouter", "系統啟動")
         try:
-            # 1. Input: 取得路徑
+            # 1. Input
             src_path = self._get_ui_path(cls_Strings.TITLE_SRC)
             dst_path = self._get_ui_path(cls_Strings.TITLE_DST)
             if not src_path or not dst_path:
@@ -403,7 +402,7 @@ class Script_AppRouter:
                 Utils_Logger.log("CRIT", "AppRouter", "迴圈防禦：輸出不可位於來源之內。")
                 return
 
-            # 2. Evaluation: DRY RUN
+            # 2. Evaluation
             evaluator = Script_DryRun(self.config)
             assessment = evaluator.evaluate(src_path, dst_path)
             
@@ -420,7 +419,7 @@ class Script_AppRouter:
                 Utils_Logger.log("INFO", "AppRouter", "使用者取消。")
                 return
 
-            # 3. Execution: 實例化並指派互不相識的流程
+            # 3. Execution
             archiver = Script_Archiver(self.config, self.state, src_path, dst_path)
             
             try:
@@ -428,15 +427,15 @@ class Script_AppRouter:
                 
                 unique_dir = dst_path / self.config.DIR_UNIQUE
                 if self.config.ENABLE_FILENAME_RESTORE:
-                    Script_Renamer(unique_dir).execute()
+                    Script_Renamer(self.config, unique_dir).execute()
                     
                 if self.config.ENABLE_DIR_FLATTENING:
                     Script_Flattener(self.config, unique_dir).execute()
 
             except KeyboardInterrupt:
-                Utils_Logger.log("CRIT", "AppRouter", "偵測到中斷訊號 (Ctrl+C)。立即停止。")
+                Utils_Logger.log("CRIT", "AppRouter", "偵測到中斷訊號 (Ctrl+C)。立即停止 (參閱 ADR-001 取代 Rollback)。")
             finally:
-                # 4. Finalization: 結算
+                # 4. Finalization
                 Script_Reporter.finalize(self.config, self.state, dst_path)
                 Utils_Logger.log("INFO", "AppRouter", "作業結束。")
                 input("\n請按 Enter 鍵關閉視窗...")
