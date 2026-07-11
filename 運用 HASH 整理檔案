@@ -1,10 +1,10 @@
 # ==========================================================
-# MODULE:       Script_GodCleanup_v2.1.1 (Decoupled Edition)
-# PURPOSE:      檔案清理與去重自動化核心 (RUTTER-FLOW-ACTION)
+# MODULE:       Script_GodCleanup_v2.1.2 (Contract Compliant Edition)
+# PURPOSE:      檔案清理與去重自動化核心 (嚴格遵守 ACDS 合約)
 # EXPORTS:      Script_AppRouter.run()
 # IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
-# FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫
-# VERSION:      2.1.1 [Stability: Stable]
+# FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
+# VERSION:      2.1.2 [Stability: Stable]
 # ==========================================================
 
 import os
@@ -43,7 +43,7 @@ class cls_AppConfig:
 
 @dataclass
 class cls_AppState:
-    """業務狀態聚合根：用以在互不相識的 Flow 之間傳遞資料"""
+    """業務狀態聚合根：用以在互不相識的 Script 模組之間傳遞資料"""
     registry: Set[str] = field(default_factory=set)
     report_data: List[list] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=lambda: {"total": 0, "unique": 0, "dup": 0, "fail": 0})
@@ -65,16 +65,16 @@ class cls_Strings:
     )
 
 # =============================================================================
-# [ACTION] 基礎設施層：絕對隔離的 I/O 操作 (Infrastructure)
-# 職責：處理所有作業系統底層呼叫，絕不包含業務邏輯判斷
+# [UTILS] 基礎設施層：絕對隔離的 I/O 操作 (Infrastructure)
+# 合約：遵守第六章 Utils_ 前綴，純函數，無業務邏輯，回傳 bool
 # =============================================================================
-class Action_Logger:
+class Utils_Logger:
     @staticmethod
     def log(level: str, module: str, message: str):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{level}] {now} {module} - {message}")
 
-class Action_FileSystem:
+class Utils_FileSystem:
     @staticmethod
     def exists(path: Path) -> bool:
         return path.exists()
@@ -177,19 +177,19 @@ class Action_FileSystem:
         return re.sub(r'[\/:*?"<>|]', '_', name)
 
 # =============================================================================
-# [FLOW] 邏輯層：單一職責的業務管線 (Business Logic Pipelines)
-# 職責：互相獨立、只依賴 ACTION 執行任務。
+# [SCRIPT] 邏輯層：單一職責的業務管線 (Business Logic Pipelines)
+# 合約：遵守第六章 Script_ 前綴。必須接住 I/O 錯誤並透過 Logger 顯式廣播。
 # =============================================================================
-class Flow_DryRun:
+class Script_DryRun:
     """職責：評估執行環境並返回評估報告數據"""
     def __init__(self, config: cls_AppConfig):
         self.config = config
 
     def evaluate(self, src: Path, dst: Path) -> dict:
-        files = Action_FileSystem.get_all_files(src)
+        files = Utils_FileSystem.get_all_files(src)
         total_size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
         req_mb = total_size_mb * self.config.SAFE_SPACE_RATIO
-        free_mb = Action_FileSystem.get_disk_free_mb(dst)
+        free_mb = Utils_FileSystem.get_disk_free_mb(dst)
         est_time = total_size_mb / self.config.ESTIMATE_MB_PER_SEC / 60
         
         return {
@@ -202,7 +202,7 @@ class Flow_DryRun:
             "is_safe": free_mb >= req_mb
         }
 
-class Flow_Archiver:
+class Script_Archiver:
     """職責：Phase 1 - 將檔案搬入沙盒、算 Hash、歸檔與標記"""
     def __init__(self, config: cls_AppConfig, state: cls_AppState, src_dir: Path, dst_dir: Path):
         self.config = config
@@ -215,24 +215,26 @@ class Flow_Archiver:
             "failed": dst_dir / config.DIR_FAILED
         }
         for p in self.paths.values():
-            Action_FileSystem.make_dir(p)
+            Utils_FileSystem.make_dir(p)
 
     def execute(self, file_list: List[Path]):
-        Action_Logger.log("INFO", "Flow_Archiver", "啟動 Phase 1: 檔案歸檔與雜湊分類")
+        Utils_Logger.log("INFO", "Script_Archiver", "啟動 Phase 1: 檔案歸檔與雜湊分類")
         for idx, src_file in enumerate(file_list, 1):
             self.state.stats["total"] += 1
             temp_file = self.paths["temp"] / src_file.name
             
             # 1. 複製至沙盒
-            if not Action_FileSystem.safe_copy(src_file, temp_file):
+            if not Utils_FileSystem.safe_copy(src_file, temp_file):
+                Utils_Logger.log("ERROR", "Script_Archiver", f"複製至沙盒失敗: {src_file.name}")
                 self._record_fail(src_file, "COPY_FAILED")
                 continue
 
             # 2. 計算雜湊
-            hash_val = Action_FileSystem.calculate_sha256(temp_file, self.config.BUFFER_SIZE)
+            hash_val = Utils_FileSystem.calculate_sha256(temp_file, self.config.BUFFER_SIZE)
             if not hash_val:
+                Utils_Logger.log("ERROR", "Script_Archiver", f"Hash 計算失敗: {src_file.name}")
                 self._record_fail(src_file, "HASH_FAILED")
-                Action_FileSystem.safe_unlink(temp_file)
+                Utils_FileSystem.safe_unlink(temp_file)
                 continue
 
             # 3. 判定分類與生成目標目錄
@@ -243,17 +245,17 @@ class Flow_Archiver:
             try:
                 rel_path = src_file.relative_to(self.src_dir)
                 target_dir = base_dir / rel_path.parent
-                Action_FileSystem.make_dir(target_dir)
+                Utils_FileSystem.make_dir(target_dir)
             except Exception:
                 target_dir = base_dir
 
             # 4. 迴避撞名與移動
-            clean_stem = Action_FileSystem.sanitize_filename(src_file.stem)[:50]
+            clean_stem = Utils_FileSystem.sanitize_filename(src_file.stem)[:50]
             short_hash = hash_val[:self.config.HASH_LENGTH]
             marked_name = f"{short_hash}_{clean_stem}_{status_tag}{src_file.suffix}"
             final_dst = self._get_safe_destination(target_dir, marked_name)
 
-            if Action_FileSystem.safe_move(temp_file, final_dst):
+            if Utils_FileSystem.safe_move(temp_file, final_dst):
                 if is_unique:
                     self.state.registry.add(hash_val)
                     self.state.stats["unique"] += 1
@@ -261,38 +263,37 @@ class Flow_Archiver:
                     self.state.stats["dup"] += 1
                 self.state.report_data.append([final_dst.name, hash_val[:8], status_tag, str(src_file)])
             else:
+                Utils_Logger.log("ERROR", "Script_Archiver", f"歸檔移動失敗: {src_file.name}")
                 self._record_fail(src_file, "MOVE_FAILED")
-                Action_FileSystem.safe_unlink(temp_file)
+                Utils_FileSystem.safe_unlink(temp_file)
 
     def _get_safe_destination(self, target_dir: Path, base_name: Path) -> Path:
-        """純函數邏輯：計算可用檔名"""
         target = target_dir / base_name
         counter = 1
-        while Action_FileSystem.exists(target):
+        while Utils_FileSystem.exists(target):
             target = target_dir / f"{target.stem}_REV{counter}{target.suffix}"
             counter += 1
         return target
 
     def _record_fail(self, src: Path, reason: str):
         self.state.stats["fail"] += 1
-        safe_name = Action_FileSystem.sanitize_filename(src.name)
+        safe_name = Utils_FileSystem.sanitize_filename(src.name)
         fail_path = self.paths["failed"] / f"ERR_{int(time.time())}_{safe_name}.txt"
         self.state.report_data.append([safe_name, "N/A", f"FAIL: {reason}", str(src)])
-        # 此處僅為防禦性紀錄，失敗不影響主線程
         try:
             with open(fail_path, "w", encoding="utf-8") as f:
                 f.write(f"Source: {src}\nReason: {reason}")
         except Exception:
             pass
 
-class Flow_Renamer:
+class Script_Renamer:
     """職責：Phase 2a - 剝離 Unique 區的印記"""
     def __init__(self, unique_dir: Path):
         self.unique_dir = unique_dir
 
     def execute(self):
-        Action_Logger.log("INFO", "Flow_Renamer", "啟動 Phase 2a: 印記剝離")
-        for root, _, files in Action_FileSystem.walk_bottom_up(self.unique_dir):
+        Utils_Logger.log("INFO", "Script_Renamer", "啟動 Phase 2a: 印記剝離")
+        for root, _, files in Utils_FileSystem.walk_bottom_up(self.unique_dir):
             current_dir = Path(root)
             for file in files:
                 old_path = current_dir / file
@@ -304,29 +305,30 @@ class Flow_Renamer:
                 ext = match.group(2) if match.group(2) else ""
                 new_path = current_dir / f"{base_name}{ext}"
 
-                if Action_FileSystem.exists(new_path) and new_path != old_path:
+                if Utils_FileSystem.exists(new_path) and new_path != old_path:
                     new_path = self._resolve_collision(current_dir, old_path, base_name, ext)
 
-                Action_FileSystem.safe_rename(old_path, new_path)
+                if not Utils_FileSystem.safe_rename(old_path, new_path):
+                    Utils_Logger.log("WARN", "Script_Renamer", f"印記剝離重新命名失敗: {old_path.name}")
 
     def _resolve_collision(self, dir_path: Path, src_path: Path, base_name: str, ext: str) -> Path:
-        mtime_str = Action_FileSystem.get_mtime_string(src_path)
+        mtime_str = Utils_FileSystem.get_mtime_string(src_path)
         counter = 1
         while True:
             candidate = dir_path / f"{base_name}_{mtime_str}_{counter:02d}{ext}"
-            if not Action_FileSystem.exists(candidate):
+            if not Utils_FileSystem.exists(candidate):
                 return candidate
             counter += 1
 
-class Flow_Flattener:
+class Script_Flattener:
     """職責：Phase 2b - 稀疏目錄隧道坍塌"""
     def __init__(self, config: cls_AppConfig, unique_dir: Path):
         self.config = config
         self.unique_dir = unique_dir
 
     def execute(self):
-        Action_Logger.log("INFO", "Flow_Flattener", "啟動 Phase 2b: 目錄隧道坍塌")
-        for root, dirs, files in Action_FileSystem.walk_bottom_up(self.unique_dir):
+        Utils_Logger.log("INFO", "Script_Flattener", "啟動 Phase 2b: 目錄隧道坍塌")
+        for root, dirs, files in Utils_FileSystem.walk_bottom_up(self.unique_dir):
             current_dir = Path(root)
             if current_dir == self.unique_dir:
                 continue
@@ -336,38 +338,42 @@ class Flow_Flattener:
                 parent_dir = current_dir.parent
                 for item in items:
                     target_path = parent_dir / item.name
-                    if Action_FileSystem.exists(target_path):
+                    if Utils_FileSystem.exists(target_path):
                         target_path = self._resolve_collision(parent_dir, item)
-                    Action_FileSystem.safe_move(item, target_path)
+                    
+                    if not Utils_FileSystem.safe_move(item, target_path):
+                        Utils_Logger.log("WARN", "Script_Flattener", f"隧道搬遷失敗: {item.name}")
                 
-                Action_FileSystem.safe_rmdir(current_dir)
+                if not Utils_FileSystem.safe_rmdir(current_dir):
+                    Utils_Logger.log("WARN", "Script_Flattener", f"空目錄拆除失敗: {current_dir.name}")
 
     def _resolve_collision(self, parent_dir: Path, item: Path) -> Path:
         base = item.stem
         ext = item.suffix
-        mtime_str = Action_FileSystem.get_mtime_string(item)
+        mtime_str = Utils_FileSystem.get_mtime_string(item)
         counter = 1
         while True:
             candidate = parent_dir / f"{base}_{mtime_str}_{counter:02d}{ext}"
-            if not Action_FileSystem.exists(candidate):
+            if not Utils_FileSystem.exists(candidate):
                 return candidate
             counter += 1
 
-class Flow_Reporter:
+class Script_Reporter:
     """職責：生成總結算報表與清理暫存"""
     @staticmethod
     def finalize(config: cls_AppConfig, state: cls_AppState, dst_dir: Path):
         temp_dir = dst_dir / config.DIR_TEMP
-        Action_FileSystem.safe_rmtree(temp_dir)
+        Utils_FileSystem.safe_rmtree(temp_dir)
         
         report_path = dst_dir / config.REPORT_FILENAME
         headers = ["處理後名稱", "SHA256_短碼", "分類狀態", "原始路徑"]
-        if Action_FileSystem.write_csv(report_path, state.report_data, headers):
-            Action_Logger.log("INFO", "Flow_Reporter", f"報告已生成: {report_path}")
+        if Utils_FileSystem.write_csv(report_path, state.report_data, headers):
+            Utils_Logger.log("INFO", "Script_Reporter", f"報告已生成: {report_path}")
+        else:
+            Utils_Logger.log("ERROR", "Script_Reporter", "報告寫入失敗。")
 
 # =============================================================================
-# [RUTTER] 路由層：控制器與應用程式進入點 (Controller)
-# 職責：與使用者互動、組合流程，攔截中斷
+# [ROUTER] 路由層：控制器與應用程式進入點 (Controller)
 # =============================================================================
 class Script_AppRouter:
     def __init__(self):
@@ -384,21 +390,21 @@ class Script_AppRouter:
         return Path(folder) if folder else None
 
     def run(self):
-        Action_Logger.log("INFO", "AppRouter", "系統啟動")
+        Utils_Logger.log("INFO", "AppRouter", "系統啟動")
         try:
             # 1. Input: 取得路徑
             src_path = self._get_ui_path(cls_Strings.TITLE_SRC)
             dst_path = self._get_ui_path(cls_Strings.TITLE_DST)
             if not src_path or not dst_path:
-                Action_Logger.log("ERROR", "AppRouter", cls_Strings.ERR_NO_PATH)
+                Utils_Logger.log("ERROR", "AppRouter", cls_Strings.ERR_NO_PATH)
                 return
 
             if src_path in dst_path.parents or src_path == dst_path:
-                Action_Logger.log("CRIT", "AppRouter", "迴圈防禦：輸出不可位於來源之內。")
+                Utils_Logger.log("CRIT", "AppRouter", "迴圈防禦：輸出不可位於來源之內。")
                 return
 
             # 2. Evaluation: DRY RUN
-            evaluator = Flow_DryRun(self.config)
+            evaluator = Script_DryRun(self.config)
             assessment = evaluator.evaluate(src_path, dst_path)
             
             print(cls_Strings.REPORT_DRY_RUN.format(
@@ -407,36 +413,36 @@ class Script_AppRouter:
             ))
 
             if not assessment["is_safe"]:
-                Action_Logger.log("CRIT", "AppRouter", cls_Strings.WARN_SPACE.format(req=assessment["req_mb"]))
+                Utils_Logger.log("CRIT", "AppRouter", cls_Strings.WARN_SPACE.format(req=assessment["req_mb"]))
                 return
 
             if input("\n確認執行？ (輸入 Y 繼續): ").strip().upper() != "Y":
-                Action_Logger.log("INFO", "AppRouter", "使用者取消。")
+                Utils_Logger.log("INFO", "AppRouter", "使用者取消。")
                 return
 
             # 3. Execution: 實例化並指派互不相識的流程
-            archiver = Flow_Archiver(self.config, self.state, src_path, dst_path)
+            archiver = Script_Archiver(self.config, self.state, src_path, dst_path)
             
             try:
                 archiver.execute(assessment["files"])
                 
                 unique_dir = dst_path / self.config.DIR_UNIQUE
                 if self.config.ENABLE_FILENAME_RESTORE:
-                    Flow_Renamer(unique_dir).execute()
+                    Script_Renamer(unique_dir).execute()
                     
                 if self.config.ENABLE_DIR_FLATTENING:
-                    Flow_Flattener(self.config, unique_dir).execute()
+                    Script_Flattener(self.config, unique_dir).execute()
 
             except KeyboardInterrupt:
-                Action_Logger.log("CRIT", "AppRouter", "偵測到中斷訊號 (Ctrl+C)。立即停止。")
+                Utils_Logger.log("CRIT", "AppRouter", "偵測到中斷訊號 (Ctrl+C)。立即停止。")
             finally:
                 # 4. Finalization: 結算
-                Flow_Reporter.finalize(self.config, self.state, dst_path)
-                Action_Logger.log("INFO", "AppRouter", "作業結束。")
+                Script_Reporter.finalize(self.config, self.state, dst_path)
+                Utils_Logger.log("INFO", "AppRouter", "作業結束。")
                 input("\n請按 Enter 鍵關閉視窗...")
 
         except Exception as e:
-            Action_Logger.log("CRIT", "AppRouter", f"嚴重錯誤:\n{traceback.format_exc()}")
+            Utils_Logger.log("CRIT", "AppRouter", f"嚴重錯誤:\n{traceback.format_exc()}")
             input("\n請按 Enter 鍵關閉視窗...")
 
 # =============================================================================
