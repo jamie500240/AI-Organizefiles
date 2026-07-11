@@ -1,0 +1,229 @@
+import os
+import shutil
+import hashlib
+import sys
+import time
+import re
+import csv
+import traceback
+from pathlib import Path
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog
+
+# ==========================================
+# SSOT: 單一設定中心 (所有邏輯以此為準)
+# ==========================================
+CONFIG = {
+    "BUFFER_SIZE": 1024 * 1024,      # 1MB 緩衝
+    "SHA_DISPLAY_LEN": 16,           # DNA 短碼長度
+    "LOCK_RETRY_LIMIT": 3,           # 檔案佔用重試次數
+    "WORKSPACE_NAME": "GOD_CLEANUP_WORKSPACE",
+    "REPORT_NAME": "God_Cleanup_Inventory.csv",
+    "MAX_STEM_LEN": 30               # 檔名截斷長度
+}
+
+class GodCleanup:
+    """
+    God Object: 檔案清理自動化核心。
+    針對單層或多層資料夾進行全自動 DNA (SHA256) 比對分類。
+    """
+    def __init__(self):
+        self.source = self._ui_choose_folder()
+        if not self.source:
+            print("❌ 未選擇資料夾，程式終止。")
+            self._pause_and_exit(0)
+
+        # 建立具備辨識度的獨立工作空間
+        source_name = self.source.name if self.source.name else "ROOT"
+        self.workspace = self.source / f"{source_name}_{CONFIG['WORKSPACE_NAME']}"
+        
+        self.paths = {
+            "ROOT": self.workspace,
+            "UNIQUE": self.workspace / "1_Unique_Archive",
+            "DUPLICATES": self.workspace / "2_Duplicates_Isolation",
+            "FAILED": self.workspace / "TEMP_FAILED",
+        }
+        
+        for p in self.paths.values():
+            p.mkdir(parents=True, exist_ok=True)
+
+        self.registry = {}    # 紀錄 {DNA: 首次出現的目標路徑}
+        self.report_data = [] # 結案報表數據
+        self.to_process = []
+        self.stats = {"total": 0, "unique": 0, "dup": 0, "fail": 0}
+        self.start_time = time.time()
+
+    @staticmethod
+    def get_file_dna(path: Path):
+        """計算 DNA (SHA256)，實踐拒絕肉眼校對。"""
+        h = hashlib.sha256()
+        try:
+            if not path.exists(): return None
+            with open(path, "rb") as f:
+                while chunk := f.read(CONFIG["BUFFER_SIZE"]):
+                    h.update(chunk)
+            return h.hexdigest()
+        except: return None
+
+    @staticmethod
+    def sanitize_name(name):
+        return re.sub(r'[\/:*?"<>|]', '_', name)
+
+    def _ui_choose_folder(self):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            folder = filedialog.askdirectory(title="【God Object 模式】請選擇清理目標")
+            root.destroy()
+            if not folder:
+                raw = input("請直接貼上資料夾路徑 (或按 Enter 退出): ").strip().replace('"', '')
+                folder = raw if raw else None
+            return Path(folder) if folder else None
+        except:
+            return None
+
+    def _pause_and_exit(self, code=0):
+        input("\n[程序終止] 按 Enter 鍵結束...")
+        sys.exit(code)
+
+    def preflight(self):
+        """Fail-Fast: 確保環境安全。"""
+        print(f"🔍 掃描來源：{self.source}")
+        
+        # 遍歷所有檔案，排除工作空間本身
+        try:
+            all_items = list(self.source.rglob('*'))
+        except Exception as e:
+            print(f"❌ 掃描失敗: {e}")
+            self._pause_and_exit(1)
+
+        self.to_process = [
+            f for f in all_items 
+            if f.is_file() and CONFIG['WORKSPACE_NAME'] not in str(f.resolve())
+        ]
+
+        if not self.to_process:
+            print("📭 沒有檔案需要處理。")
+            self._pause_and_exit(0)
+
+        total_size = sum(f.stat().st_size for f in self.to_process)
+        disk = shutil.disk_usage(self.source)
+        
+        print(f"📊 待處理: {len(self.to_process)} 檔案 | 體積: {total_size/1024/1024:.2f} MB")
+        if disk.free < total_size * 1.1:
+            print(f"🛑 空間不足！至少需要 {total_size*1.1/1024/1024:.2f} MB")
+            self._pause_and_exit(1)
+
+        confirm = input("⚠️ 確認執行複製與分類作業？(輸入 YES 執行): ").strip().upper()
+        if confirm != "YES":
+            self._pause_and_exit(0)
+
+    def generate_god_name(self, src: Path, sha_short: str, status: str, seq: int):
+        clean_stem = self.sanitize_name(src.stem[:CONFIG["MAX_STEM_LEN"]])
+        rev_tag = f"_REV{seq}" if seq > 0 else ""
+        name = f"DNA_{sha_short}_【{clean_stem}】_{status}{rev_tag}{src.suffix}"
+        # 處理極長路徑 Windows 限制
+        if len(name) > 150:
+            name = f"DNA_{sha_short}_S{seq}_{int(time.time())}{src.suffix}"
+        return name
+
+    def execute(self):
+        """核心執行邏輯：自動處理單層與多層結構。"""
+        for idx, src in enumerate(self.to_process, 1):
+            self.stats["total"] += 1
+            dna = self.get_file_dna(src)
+            
+            if not dna:
+                self.handle_fail(src, "DNA_READ_ERROR")
+                continue
+
+            sha_short = dna[:CONFIG["SHA_DISPLAY_LEN"]]
+            is_unique = dna not in self.registry
+            target_base = self.paths["UNIQUE"] if is_unique else self.paths["DUPLICATES"]
+            status_label = "UNIQUE" if is_unique else "DUP"
+
+            # 【關鍵修復】處理單層資料夾路徑
+            try:
+                rel_path = src.relative_to(self.source)
+                rel_parent = rel_path.parent
+                # 如果是單層檔案，rel_parent 會是 Path('.')，這在建立目錄時沒問題
+                full_target_dir = target_base / rel_parent
+                full_target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self.handle_fail(src, f"PATH_ERROR_{str(e)[:10]}")
+                continue
+
+            # 解決名稱衝突 (SSOT: 絕不覆蓋)
+            seq = 0
+            while True:
+                dst_name = self.generate_god_name(src, sha_short, status_label, seq)
+                dst = full_target_dir / dst_name
+                if not dst.exists(): break
+                seq += 1
+
+            # 執行複製與二重檢核
+            success = False
+            for _ in range(CONFIG["LOCK_RETRY_LIMIT"]):
+                try:
+                    shutil.copy2(src, dst)
+                    if self.get_file_dna(dst) == dna:
+                        success = True
+                        break
+                    else:
+                        if dst.exists(): dst.unlink()
+                except:
+                    time.sleep(0.5)
+
+            if not success:
+                self.handle_fail(src, "COPY_VERIFY_FAILED")
+            else:
+                if is_unique:
+                    self.registry[dna] = dst
+                    self.stats["unique"] += 1
+                else:
+                    self.stats["dup"] += 1
+                self.report_data.append([dst.name, sha_short, status_label, str(src)])
+
+            if idx % 10 == 0 or idx == len(self.to_process):
+                print(f"⚡ 進度: {idx}/{len(self.to_process)} (唯一:{self.stats['unique']} 重複:{self.stats['dup']})")
+
+    def handle_fail(self, src: Path, reason: str):
+        self.stats["fail"] += 1
+        fn = f"ERR_{int(time.time())}_{self.sanitize_name(src.name)}"
+        print(f"❌ 處理失敗: {src.name} 原因: {reason}")
+        try:
+            shutil.copy2(src, self.paths["FAILED"] / fn)
+        except:
+            pass
+        self.report_data.append([fn, "N/A", f"FAIL_{reason}", str(src)])
+
+    def finalize(self):
+        """結案報表與總結。"""
+        report_name = f"{self.source.name}_{CONFIG['REPORT_NAME']}"
+        report_path = self.workspace / report_name
+
+        try:
+            with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["最終名稱", "DNA短碼", "狀態", "原始路徑"])
+                writer.writerows(self.report_data)
+        except Exception as e:
+            print(f"❌ 報表寫入失敗: {e}")
+
+        print("\n" + "═"*50)
+        print(f"✨ 任務完成！耗時: {time.time()-self.start_time:.2f}s")
+        print(f"✅ 唯一: {self.stats['unique']} | ⚠️ 重複: {self.stats['dup']} | ❌ 失敗: {self.stats['fail']}")
+        print(f"📄 CSV報表已產生: {report_path}")
+        self._pause_and_exit(0)
+
+if __name__ == "__main__":
+    try:
+        app = GodCleanup()
+        app.preflight()
+        app.execute()
+        app.finalize()
+    except Exception as e: 
+        print(f"\n💥 致命錯誤:\n{traceback.format_exc()}")
+        input("\n請截圖上方錯誤訊息後，按 Enter 關閉...")
