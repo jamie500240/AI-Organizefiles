@@ -1,148 +1,282 @@
 import hashlib
-from pathlib import Path
 import csv
-from collections import defaultdict
 import os
 import sys
+import logging
+from pathlib import Path
+from collections import defaultdict
 
 # ==========================================
-# SSOT: 跨檔名比對配置
+# 1. SET (開關) 
 # ==========================================
-CONFIG = {
-    "REPORT_NAME": "Archive_Verification_Report.csv",
-    "HASH_ALGO": "sha256",
-    "CHUNK_SIZE": 16384
-}
+# 控制程式整體行為的開關 (Feature Flags)
+class SetToggle:
+    DEBUG_MODE = False       # 是否顯示詳細錯誤追蹤
+    SHOW_PROGRESS = True     # 是否在終端機顯示進度條
 
-# 終端機顏色
-class Color:
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+# ==========================================
+# 2. CONFIG (配置)
+# ==========================================
+# 單一真理來源 (SSOT)，負責管理所有魔法數字與環境設定
+class Config:
+    REPORT_NAME = "Archive_Verification_Report.csv"
+    HASH_ALGO = "sha256"
+    CHUNK_SIZE = 16384       # 16KB 讀取緩衝
+    ENCODING = "utf-8-sig"   # 確保 Excel 開啟 CSV 不會亂碼
+    PROGRESS_INTERVAL = 20   # 每掃描幾次更新一次畫面
+    
+    class Color:
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RED = '\033[91m'
+        BLUE = '\033[94m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
 
-class ArchiveVerifierGod:
-    def __init__(self, original_dir, archived_dir):
-        # 防禦性路徑處理
-        self.original = Path(original_dir).resolve()
-        self.archived = Path(archived_dir).resolve()
-        # 將報告產在執行目錄或原始目錄同級
-        self.report_path = self.original.parent / CONFIG["REPORT_NAME"]
+# ==========================================
+# 3. STRING (字串字典)
+# ==========================================
+# 將 UI 提示、報表標題、狀態文字全部解耦，方便未來做 i18n 多語系
+class StringStore:
+    # 終端機 UI
+    APP_TITLE = "【檔案歸檔審計系統 - 高內聚解耦版】"
+    PROMPT_ORIGIN = "1. 請輸入【原始資料夾】路徑: "
+    PROMPT_ARCHIVE = "2. 請輸入【歸檔後資料夾】路徑: "
+    MSG_SCANNING = "📂 掃描中: {folder_name} (共 {total} 個檔案)"
+    MSG_PROGRESS = "  > 已讀取: {count}/{total}"
+    MSG_SCAN_DONE = "\n  ✅ {folder_name} 掃描完成。"
+    
+    # 報錯文字
+    ERR_PATH_NOT_EXIST = "❌ 路徑不存在: {path}"
+    ERR_NOT_A_DIR = "❌ 路徑不是一個資料夾: {path}"
+    ERR_READ_FILE = "❌ 無法讀取檔案 (可能是權限或鎖定問題): {path}"
+    ERR_SYS_FAIL = "💥 系統執行失敗: {error}"
+    
+    # CSV 報表與狀態 (DDD 領域詞彙)
+    CSV_HEADERS = ["Hash 指紋 (縮寫)", "比對結果", "原始檔名", "歸檔後檔名"]
+    STAT_MATCH = "✅ 內容一致"
+    STAT_OPTIMIZED = "💎 內容一致 (檔名已優化)"
+    STAT_MISSING = "❌ 歸檔遺漏"
+    STAT_NEW = "➕ 歸檔新增"
+    EMPTY_MARK = "---"
+
+# ==========================================
+# 4. RULE (規則與防衛)
+# ==========================================
+# Fail Fast 精神：遇到不合法的狀態立刻拋出例外，絕不靜默失敗
+class DomainRuleException(Exception):
+    """自定義的領域例外類別"""
+    pass
+
+class RuleGuard:
+    @staticmethod
+    def validate_directory(path_str: str) -> Path:
+        """驗證輸入路徑是否合法，不合法直接拋錯 (Fail Fast)"""
+        path_str = path_str.strip().strip('"')
+        p = Path(path_str).resolve()
         
-        # 統計數據
-        self.stats = {"match": 0, "optimized": 0, "missing": 0, "new": 0}
+        if not p.exists():
+            raise DomainRuleException(StringStore.ERR_PATH_NOT_EXIST.format(path=p))
+        if not p.is_dir():
+            raise DomainRuleException(StringStore.ERR_NOT_A_DIR.format(path=p))
+        
+        return p
 
-    def _get_hash(self, path):
-        h = hashlib.new(CONFIG["HASH_ALGO"])
+# ==========================================
+# 6. ACTION (基礎設施與領域動作) 
+# *註：Python 需要先定義 ACTION 才能讓 FLOW 呼叫
+# ==========================================
+# 每個 Class 只做一件事情 (單一職責原則 SRP)
+
+class FileInfraAction:
+    """負責與檔案系統底層溝通的基礎設施"""
+    
+    @staticmethod
+    def calculate_hash(file_path: Path) -> str:
+        """計算檔案 Hash。如果讀取失敗，絕對不靜默回傳 None，而是大聲報錯！"""
+        h = hashlib.new(Config.HASH_ALGO)
         try:
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(CONFIG["CHUNK_SIZE"]), b""):
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(Config.CHUNK_SIZE), b""):
                     h.update(chunk)
             return h.hexdigest()
-        except: return None
+        except Exception as e:
+            # 攔截到底層錯誤，轉譯成我們的領域錯誤拋出
+            raise DomainRuleException(StringStore.ERR_READ_FILE.format(path=file_path)) from e
 
-    def _scan_to_dict(self, base_path):
-        """掃描資料夾，建立 {Hash: [檔案路徑清單]}"""
+class ScannerAction:
+    """負責領域邏輯：遍歷目錄並建立 Hash 對應表"""
+    
+    @staticmethod
+    def scan_to_dict(base_path: Path, progress_callback=None) -> dict:
         data = defaultdict(list)
-        all_files = list(base_path.rglob("*"))
-        total = len([f for f in all_files if f.is_file()])
+        all_files = [f for f in base_path.rglob("*") if f.is_file() and f.name != Config.REPORT_NAME]
+        total = len(all_files)
         
-        print(f"📂 掃描中: {base_path.name} (共 {total} 個檔案)")
-        
-        count = 0
-        for f in all_files:
-            if f.is_file() and f.name != CONFIG["REPORT_NAME"]:
-                f_hash = self._get_hash(f)
-                if f_hash:
-                    data[f_hash].append(str(f.relative_to(base_path)))
-                    count += 1
-                    if count % 20 == 0:
-                        print(f"  > 已讀取: {count}/{total}", end="\r")
-        print(f"\n  ✅ {base_path.name} 掃描完成。")
+        for count, f in enumerate(all_files, start=1):
+            f_hash = FileInfraAction.calculate_hash(f)
+            # 儲存相對路徑
+            data[f_hash].append(str(f.relative_to(base_path)))
+            
+            # 觸發回呼函數，解耦 UI
+            if progress_callback and count % Config.PROGRESS_INTERVAL == 0:
+                progress_callback(count, total)
+                
+        # 確保最後 100% 的進度也有觸發
+        if progress_callback:
+            progress_callback(total, total)
+            
         return data
 
-    def execute(self):
-        # 1. 執行掃描
-        origin_map = self._scan_to_dict(self.original)
-        archive_map = self._scan_to_dict(self.archived)
+# ==========================================
+# 5. FLOW (應用服務層 / 流程編排)
+# ==========================================
+# 不涉及底層細節，只負責「說故事」：先驗證、再掃描、再比對、最後產報表
+class ArchiveAuditFlow:
+    def __init__(self, origin_path: str, archive_path: str):
+        # 1. RULE 檢核
+        self.origin_dir = RuleGuard.validate_directory(origin_path)
+        self.archive_dir = RuleGuard.validate_directory(archive_path)
+        self.report_path = self.origin_dir.parent / Config.REPORT_NAME
+        
+        # 統計數據 (領域狀態)
+        self.stats = {"match": 0, "optimized": 0, "missing": 0, "new": 0}
+        self.report_rows = []
 
+    def execute(self):
+        """流程大管家"""
+        # 2. 執行 ACTION 掃描 (並注入 UI 呈現方式)
+        print(StringStore.MSG_SCANNING.format(folder_name=self.origin_dir.name, total="計算中..."))
+        origin_map = ScannerAction.scan_to_dict(self.origin_dir, self._ui_callback)
+        print(StringStore.MSG_SCAN_DONE.format(folder_name=self.origin_dir.name))
+
+        print(StringStore.MSG_SCANNING.format(folder_name=self.archive_dir.name, total="計算中..."))
+        archive_map = ScannerAction.scan_to_dict(self.archive_dir, self._ui_callback)
+        print(StringStore.MSG_SCAN_DONE.format(folder_name=self.archive_dir.name))
+
+        # 3. 領域邏輯：進行比對
+        self._compare_maps(origin_map, archive_map)
+
+        # 4. 基礎設施：寫入報表
+        self._write_report()
+
+        # 5. 回傳統計數據供 Rutter 顯示
+        return self.stats, self.report_path
+
+    def _ui_callback(self, current, total):
+        if SetToggle.SHOW_PROGRESS:
+            print(StringStore.MSG_PROGRESS.format(count=current, total=total), end="\r")
+
+    def _compare_maps(self, origin_map, archive_map):
+        """核心比對邏輯 (DDD Domain Logic)"""
         all_hashes = set(origin_map.keys()) | set(archive_map.keys())
         
-        # 2. 寫入報告並計算統計
-        with open(self.report_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Hash 指紋 (縮寫)", "比對結果", "原始檔名", "歸檔後檔名"])
+        for h in sorted(all_hashes):
+            orig_files = origin_map.get(h, [])
+            arch_files = archive_map.get(h, [])
 
-            for h in sorted(all_hashes):
-                orig_files = origin_map.get(h, [])
-                arch_files = archive_map.get(h, [])
-
-                # 情況 1: 內容一致
-                if orig_files and arch_files:
-                    for o in orig_files:
-                        for a in arch_files:
-                            if o == a:
-                                status = "✅ 內容一致"
-                                self.stats["match"] += 1
-                            else:
-                                status = "💎 內容一致 (檔名已優化)"
-                                self.stats["optimized"] += 1
-                            writer.writerow([h[:8], status, o, a])
-
-                # 情況 2: 歸檔遺漏
-                elif orig_files:
-                    for o in orig_files:
-                        self.stats["missing"] += 1
-                        writer.writerow([h[:8], "❌ 歸檔遺漏", o, "---"])
-
-                # 情況 3: 歸檔新增
-                elif arch_files:
+            # 情境一：兩邊都有 (一致或優化檔名)
+            if orig_files and arch_files:
+                for o in orig_files:
                     for a in arch_files:
-                        self.stats["new"] += 1
-                        writer.writerow([h[:8], "➕ 歸檔新增", "---", a])
+                        if o == a:
+                            status = StringStore.STAT_MATCH
+                            self.stats["match"] += 1
+                        else:
+                            status = StringStore.STAT_OPTIMIZED
+                            self.stats["optimized"] += 1
+                        self.report_rows.append([h[:8], status, o, a])
+            
+            # 情境二：原始有、歸檔無 (遺漏)
+            elif orig_files:
+                for o in orig_files:
+                    self.stats["missing"] += 1
+                    self.report_rows.append([h[:8], StringStore.STAT_MISSING, o, StringStore.EMPTY_MARK])
+            
+            # 情境三：原始無、歸檔有 (新增)
+            elif arch_files:
+                for a in arch_files:
+                    self.stats["new"] += 1
+                    self.report_rows.append([h[:8], StringStore.STAT_NEW, StringStore.EMPTY_MARK, a])
 
-        # 3. 終端機視覺化總結
-        self.display_summary()
+    def _write_report(self):
+        """將比對結果輸出成 CSV"""
+        with open(self.report_path, "w", newline="", encoding=Config.ENCODING) as f:
+            writer = csv.writer(f)
+            writer.writerow(StringStore.CSV_HEADERS)
+            writer.writerows(self.report_rows)
 
-    def display_summary(self):
-        """God Interface: 終端機結果看板"""
+
+# ==========================================
+# 7. RUTTER (路由與收尾 / 控制器)
+# ==========================================
+# 負責啟動程式、與終端機互動、捕捉「所有的」例外狀況、並寫下 LOG
+class AppRutter:
+    @staticmethod
+    def setup_logger():
+        """設定全局日誌 (LOG)，滿足結尾留下追蹤紀錄的需求"""
+        logging.basicConfig(
+            filename='audit_run.log', 
+            level=logging.ERROR if not SetToggle.DEBUG_MODE else logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    @staticmethod
+    def display_summary(stats, report_path):
+        """渲染最終畫面"""
+        C = Config.Color
         print("\n" + "═"*60)
-        print(f" {Color.BOLD}{Color.BLUE}📊 檔案歸檔驗證報告 (DNA 比對模式){Color.END} ")
+        print(f" {C.BOLD}{C.BLUE}📊 檔案歸檔驗證報告 (DNA 比對模式){C.END} ")
         print("═"*60)
-        
-        print(f"{Color.GREEN}  ✅ 完全一致 (Match):      {self.stats['match']:>4} 檔案{Color.END}")
-        print(f"{Color.BLUE}  💎 重新命名 (Optimized):  {self.stats['optimized']:>4} 檔案{Color.END}")
-        print(f"{Color.RED}  ❌ 歸檔遺漏 (Missing):    {self.stats['missing']:>4} 檔案 (!!){Color.END}")
-        print(f"{Color.YELLOW}  ➕ 歸檔新增 (New):        {self.stats['new']:>4} 檔案{Color.END}")
-        
+        print(f"{C.GREEN}  ✅ 完全一致 (Match):      {stats['match']:>4} 檔案{C.END}")
+        print(f"{C.BLUE}  💎 重新命名 (Optimized):  {stats['optimized']:>4} 檔案{C.END}")
+        print(f"{C.RED}  ❌ 歸檔遺漏 (Missing):    {stats['missing']:>4} 檔案 (!!){C.END}")
+        print(f"{C.YELLOW}  ➕ 歸檔新增 (New):        {stats['new']:>4} 檔案{C.END}")
         print("-" * 60)
-        print(f"📝 詳細報告已存至：{Color.BOLD}{self.report_path}{Color.END}")
+        print(f"📝 詳細報告已存至：{C.BOLD}{report_path}{C.END}")
         
-        if self.stats["missing"] == 0:
-            print(f"\n{Color.GREEN}{Color.BOLD}🛡️  安全確認：所有原始檔案均已成功備份/歸檔。{Color.END}")
+        if stats["missing"] == 0:
+            print(f"\n{C.GREEN}{C.BOLD}🛡️  安全確認：所有原始檔案均已成功備份/歸檔。{C.END}")
         else:
-            print(f"\n{Color.RED}{Color.BOLD}⚠️  警告：尚有 {self.stats['missing']} 個檔案未出現在歸檔資料夾中！{Color.END}")
-        
+            print(f"\n{C.RED}{C.BOLD}⚠️  警告：尚有 {stats['missing']} 個檔案未出現在歸檔資料夾中！{C.END}")
         print("═"*60)
-        input("\n[比對完成] 請按 Enter 鍵關閉...")
 
-if __name__ == "__main__":
-    # 清除畫面 (Windows/Unix)
-    os.system('cls' if os.name == 'nt' else 'clear')
-    
-    print(f"{Color.BOLD}【歸檔審計 God Object】{Color.END}\n")
-    dir_o = input("1. 請輸入【原始資料夾】路徑: ").strip().strip('"')
-    dir_a = input("2. 請輸入【歸檔後資料夾】路徑: ").strip().strip('"')
-    
-    if Path(dir_o).is_dir() and Path(dir_a).is_dir():
-        verifier = ArchiveVerifierGod(dir_o, dir_a)
+    @staticmethod
+    def run():
+        # 清空終端機畫面
+        os.system('cls' if os.name == 'nt' else 'clear')
+        AppRutter.setup_logger()
+
+        C = Config.Color
+        print(f"{C.BOLD}{StringStore.APP_TITLE}{C.END}\n")
+        
+        dir_o = input(StringStore.PROMPT_ORIGIN)
+        dir_a = input(StringStore.PROMPT_ARCHIVE)
+
         try:
-            verifier.execute()
+            # 建立並執行 FLOW
+            flow = ArchiveAuditFlow(dir_o, dir_a)
+            final_stats, report_path = flow.execute()
+            
+            # RUTTER 負責收尾畫面
+            AppRutter.display_summary(final_stats, report_path)
+
+        except DomainRuleException as dre:
+            # 捕捉我們自己設計的領域錯誤 (Fail Fast 攔截)
+            print(f"\n{C.RED}{dre}{C.END}")
+            logging.warning(f"領域規則錯誤中斷: {dre}")
+            
         except Exception as e:
-            print(f"\n{Color.RED}💥 執行失敗: {e}{Color.END}")
-            input("按 Enter 結束...")
-    else:
-        print(f"{Color.RED}❌ 路徑錯誤，請確認資料夾存在。{Color.END}")
-        input("按 Enter 結束...")
+            # 捕捉未預期的系統級崩潰
+            print(f"\n{C.RED}{StringStore.ERR_SYS_FAIL.format(error=e)}{C.END}")
+            logging.error("系統未預期崩潰", exc_info=True)  # 寫入 LOG
+
+        finally:
+            # 無論成功或失敗，RUTTER 都會優雅地收尾
+            input("\n[程式結束] 請按 Enter 鍵關閉...")
+
+# ==========================================
+# Entry Point
+# ==========================================
+if __name__ == "__main__":
+    AppRutter.run()
