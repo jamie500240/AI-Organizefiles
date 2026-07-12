@@ -1,12 +1,11 @@
 # ==========================================================
-# MODULE:       Script_ArchiveAudit_v1.0.1
+# MODULE:       Script_ArchiveAudit_v1.0.2
 # PURPOSE:      比對原始資料夾與歸檔資料夾之內容，依據 Hash 驗證是否遺漏或撞名。
 # EXPORTS:      RunApp()
 # IMPORTS:      hashlib, csv, os, datetime, pathlib, collections.defaultdict
-# CONTRACTS:    [Schema] REPORT_NAME, CSV_HEADERS (需登記於 ACDS_ContractRegistry)
 # FORBIDDEN:    禁止靜默忽略無法讀取的檔案；禁止直接移動或刪除任何檔案。
-# DEPENDENCIES: 本機檔案系統讀取權限
-# VERSION:      1.0.1 [Stability: Stable]
+# DEPENDENCIES: 本機 IO 權限; [Schema] REPORT_PREFIX, CSV_HEADERS
+# VERSION:      1.0.2 [Stability: Stable]
 # ==========================================================
 
 import hashlib
@@ -17,24 +16,25 @@ from pathlib import Path
 from collections import defaultdict
 
 # ==========================================
-# [SSOT] 第五章：Contract 與環境配置
+# [SSOT] 配置與字串字典 (Config & String)
 # ==========================================
 class cls_Config:
-    REPORT_NAME = "Archive_Verification_Report.csv"
+    REPORT_PREFIX = "Archive_Verification_Report"
     HASH_ALGO = "sha256"
     CHUNK_SIZE = 16384       # 16KB 讀取緩衝
     ENCODING = "utf-8-sig"   # 確保 Excel 開啟 CSV 不亂碼
     PROGRESS_INTERVAL = 20
 
 class cls_StringRegistry:
-    # UI 與日誌訊息 (解耦，方便未來 i18n)
+    # UI 與日誌訊息
     APP_TITLE = "【ACDS v2.1 檔案歸檔審計系統】"
     PROMPT_ORIGIN = "1. 請輸入【原始資料夾】路徑: "
     PROMPT_ARCHIVE = "2. 請輸入【歸檔後資料夾】路徑: "
     
-    # 報錯文字 (Fail-Fast 專用)
+    # 報錯文字 (Fail-Fast)
     ERR_PATH_NOT_EXIST = "路徑不存在: {path}"
     ERR_NOT_A_DIR = "路徑不是一個資料夾: {path}"
+    ERR_NESTED_DIR = "安全阻斷：原始與歸檔資料夾不可相同或互相包含 (巢狀目錄)"
     ERR_READ_FILE = "無法讀取檔案 (權限或鎖定問題): {path}"
     
     # CSV 報表合約 (Schema)
@@ -46,85 +46,54 @@ class cls_StringRegistry:
     EMPTY_MARK = "---"
 
 # ==========================================
-# [Logging] 第十六章：日誌規範
+# [Logging] 日誌規範
 # ==========================================
 class cls_Logger:
-    """
-    符合 ACDS 規範的日誌系統。
-    格式: [標籤] 日期時間 模組名稱 訊息內容
-    特性: 終端機色彩顯示 + 持久化寫入 Log 檔案
-    """
     LOG_FILE = "ArchiveAudit_System.log"
-    
-    # 終端機顏色
-    C_GREEN = '\033[92m'
-    C_YELLOW = '\033[93m'
-    C_RED = '\033[91m'
-    C_END = '\033[0m'
-    C_MAGENTA = '\033[45m\033[97m' # 亮紅底白字 (CRIT)
+    C_GREEN, C_YELLOW, C_RED, C_END = '\033[92m', '\033[93m', '\033[91m', '\033[0m'
+    C_MAGENTA = '\033[45m\033[97m' # CRIT
 
     @staticmethod
     def _log(level: str, module: str, msg: str, color: str = ""):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # 1. 無色彩的純文字版本 (用於寫檔)
         plain_msg = f"[{level}] {now} {module} {msg}"
+        print(f"{color}{plain_msg}{cls_Logger.C_END}")
         
-        # 2. 終端機色彩版本
-        formatted_msg = f"{color}{plain_msg}{cls_Logger.C_END}"
-        print(formatted_msg)
-        
-        # 3. [P4 修正] 持久化寫入檔案，確保稽核追溯性
         try:
             with open(cls_Logger.LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(plain_msg + "\n")
         except Exception as e:
-            # 日誌模組自身的錯誤不應導致業務主流程中斷，但需緊急印出
             print(f"{cls_Logger.C_MAGENTA}[CRIT] 日誌寫檔失敗: {e}{cls_Logger.C_END}")
 
     @staticmethod
-    def info(module: str, msg: str):
-        cls_Logger._log("INFO", module, msg, cls_Logger.C_GREEN)
-
+    def info(module: str, msg: str): cls_Logger._log("INFO", module, msg, cls_Logger.C_GREEN)
     @staticmethod
-    def warn(module: str, msg: str):
-        cls_Logger._log("WARN", module, msg, cls_Logger.C_YELLOW)
-
+    def warn(module: str, msg: str): cls_Logger._log("WARN", module, msg, cls_Logger.C_YELLOW)
     @staticmethod
-    def error(module: str, msg: str):
-        cls_Logger._log("ERROR", module, msg, cls_Logger.C_RED)
-
+    def error(module: str, msg: str): cls_Logger._log("ERROR", module, msg, cls_Logger.C_RED)
     @staticmethod
-    def crit(module: str, msg: str):
-        cls_Logger._log("CRIT", module, msg, cls_Logger.C_MAGENTA)
+    def crit(module: str, msg: str): cls_Logger._log("CRIT", module, msg, cls_Logger.C_MAGENTA)
 
 # ==========================================
 # [Rule] 領域規則與防衛 (Fail-Fast)
 # ==========================================
-
-# [P3 修正] 例外分流：明確區分業務規則例外與底層基礎設施例外
-class DomainRuleException(Exception):
-    """領域專屬例外，用於輸入驗證與業務邏輯阻斷"""
-    pass
-
-class InfraException(Exception):
-    """基礎設施例外，用於網路、檔案 IO、權限等底層錯誤"""
-    pass
-
+class DomainRuleException(Exception): pass
+class InfraException(Exception): pass
 
 class cls_PathRule:
     @staticmethod
-    def validate_directory(path_str: str, module_name: str) -> Path:
-        """第參章 第七條：輸入驗證與正規化"""
+    def validate_directory(path_str: str) -> Path:
         path_str = path_str.strip().strip('"')
         p = Path(path_str).resolve()
-        
-        if not p.exists():
-            raise DomainRuleException(cls_StringRegistry.ERR_PATH_NOT_EXIST.format(path=p))
-        if not p.is_dir():
-            raise DomainRuleException(cls_StringRegistry.ERR_NOT_A_DIR.format(path=p))
-        
+        if not p.exists(): raise DomainRuleException(cls_StringRegistry.ERR_PATH_NOT_EXIST.format(path=p))
+        if not p.is_dir(): raise DomainRuleException(cls_StringRegistry.ERR_NOT_A_DIR.format(path=p))
         return p
+
+    @staticmethod
+    def validate_cross_directories(dir_o: Path, dir_a: Path):
+        """[P4 修正] 防呆：檢查兩個目錄是否互相包含，防止掃描互相汙染"""
+        if dir_o == dir_a or dir_o in dir_a.parents or dir_a in dir_o.parents:
+            raise DomainRuleException(cls_StringRegistry.ERR_NESTED_DIR)
 
 # ==========================================
 # [Infrastructure] 資料基礎層 (Action)
@@ -132,7 +101,6 @@ class cls_PathRule:
 class cls_FileInfra:
     @staticmethod
     def calculate_hash(file_path: Path) -> str:
-        """計算檔案 Hash，若失敗絕對不靜默，立刻拋錯"""
         h = hashlib.new(cls_Config.HASH_ALGO)
         try:
             with open(file_path, "rb") as f:
@@ -140,7 +108,6 @@ class cls_FileInfra:
                     h.update(chunk)
             return h.hexdigest()
         except Exception as e:
-            # [P3 修正] 使用 InfraException 代表 IO 錯誤
             raise InfraException(cls_StringRegistry.ERR_READ_FILE.format(path=file_path)) from e
 
 # ==========================================
@@ -149,29 +116,23 @@ class cls_FileInfra:
 class cls_ScannerService:
     @staticmethod
     def scan_to_dict(base_path: Path, module_name: str) -> dict:
-        """掃描目錄並回傳 {Hash: [相對路徑清單]}"""
         data = defaultdict(list)
-        
-        # 取得所有非報表檔案
-        all_files = [f for f in base_path.rglob("*") if f.is_file() and f.name != cls_Config.REPORT_NAME]
+        all_files = [f for f in base_path.rglob("*") if f.is_file() and not f.name.startswith(cls_Config.REPORT_PREFIX)]
         total = len(all_files)
         
         cls_Logger.info(module_name, f"開始掃描，共計 {total} 個檔案。")
-        
         for count, f in enumerate(all_files, start=1):
             f_hash = cls_FileInfra.calculate_hash(f)
             data[f_hash].append(str(f.relative_to(base_path)))
             
-            # 簡易進度呈現 (不干擾 Log)
             if count % cls_Config.PROGRESS_INTERVAL == 0 or count == total:
                 print(f"  > 已處理: {count}/{total}...", end="\r")
                 
-        print() # 換行清除進度條
+        print() 
         cls_Logger.info(module_name, f"掃描完成。")
         return data
 
 class cls_AuditService:
-    """負責比對兩個 Map 並產生統計與報表結構 (單一職責)"""
     def __init__(self, origin_map: dict, archive_map: dict):
         self.origin_map = origin_map
         self.archive_map = archive_map
@@ -179,32 +140,36 @@ class cls_AuditService:
         self.report_rows = []
 
     def run_comparison(self):
+        """[P1 修正] 使用 1 對 1 配對 (zip 邏輯)，取代笛卡兒積，解決重複檔案導致的數據膨脹"""
         all_hashes = set(self.origin_map.keys()) | set(self.archive_map.keys())
         
         for h in sorted(all_hashes):
             orig_files = self.origin_map.get(h, [])
             arch_files = self.archive_map.get(h, [])
 
-            if orig_files and arch_files:
-                for o in orig_files:
-                    for a in arch_files:
-                        if o == a:
-                            status = cls_StringRegistry.STAT_MATCH
-                            self.stats["match"] += 1
-                        else:
-                            status = cls_StringRegistry.STAT_OPTIMIZED
-                            self.stats["optimized"] += 1
-                        self.report_rows.append([h[:8], status, o, a])
+            # 1. 計算兩邊皆有的配對數量 (取最小值)
+            paired_count = min(len(orig_files), len(arch_files))
             
-            elif orig_files:
-                for o in orig_files:
-                    self.stats["missing"] += 1
-                    self.report_rows.append([h[:8], cls_StringRegistry.STAT_MISSING, o, cls_StringRegistry.EMPTY_MARK])
+            # 2. 處理成功配對的部分 (Match 或 Optimized)
+            for i in range(paired_count):
+                o, a = orig_files[i], arch_files[i]
+                if o == a:
+                    status = cls_StringRegistry.STAT_MATCH
+                    self.stats["match"] += 1
+                else:
+                    status = cls_StringRegistry.STAT_OPTIMIZED
+                    self.stats["optimized"] += 1
+                self.report_rows.append([h[:8], status, o, a])
             
-            elif arch_files:
-                for a in arch_files:
-                    self.stats["new"] += 1
-                    self.report_rows.append([h[:8], cls_StringRegistry.STAT_NEW, cls_StringRegistry.EMPTY_MARK, a])
+            # 3. 處理原始資料夾多出來的檔案 (Missing)
+            for i in range(paired_count, len(orig_files)):
+                self.stats["missing"] += 1
+                self.report_rows.append([h[:8], cls_StringRegistry.STAT_MISSING, orig_files[i], cls_StringRegistry.EMPTY_MARK])
+
+            # 4. 處理歸檔資料夾多出來的檔案 (New)
+            for i in range(paired_count, len(arch_files)):
+                self.stats["new"] += 1
+                self.report_rows.append([h[:8], cls_StringRegistry.STAT_NEW, cls_StringRegistry.EMPTY_MARK, arch_files[i]])
                     
         return self.stats, self.report_rows
 
@@ -223,7 +188,6 @@ class cls_MainController:
                 writer.writerows(rows)
             cls_Logger.info("報表輸出", f"報告已成功寫入: {report_path.name}")
         except Exception as e:
-            # [P3 修正] 使用 InfraException 代表寫檔等 IO 錯誤
             raise InfraException(f"報表寫入失敗: {e}")
 
     @staticmethod
@@ -237,20 +201,25 @@ class cls_MainController:
 
         try:
             # 1. 規則驗證 (Fail-Fast)
-            origin_dir = cls_PathRule.validate_directory(dir_o_str, "原始路徑驗證")
-            archive_dir = cls_PathRule.validate_directory(dir_a_str, "歸檔路徑驗證")
-            report_path = origin_dir.parent / cls_Config.REPORT_NAME
+            origin_dir = cls_PathRule.validate_directory(dir_o_str)
+            archive_dir = cls_PathRule.validate_directory(dir_a_str)
+            cls_PathRule.validate_cross_directories(origin_dir, archive_dir) # 巢狀防呆
+            
+            # [P4 修正] 動態產生報表檔名，加上 Timestamp 防止覆寫
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_filename = f"{cls_Config.REPORT_PREFIX}_{timestamp}.csv"
+            report_path = origin_dir.parent / report_filename
 
-            # 2. 執行掃描 (Service)
+            # 2. 執行掃描
             origin_map = cls_ScannerService.scan_to_dict(origin_dir, "原始資料夾掃描")
             archive_map = cls_ScannerService.scan_to_dict(archive_dir, "歸檔資料夾掃描")
 
-            # 3. 領域邏輯比對 (Service)
+            # 3. 領域邏輯比對
             cls_Logger.info(cls_MainController.MODULE_NAME, "開始進行 DNA 雜湊比對...")
             audit_svc = cls_AuditService(origin_map, archive_map)
             stats, report_rows = audit_svc.run_comparison()
 
-            # 4. 寫入報表 (Infra/Action)
+            # 4. 寫入報表
             cls_MainController.export_csv(report_path, report_rows)
 
             # 5. 結果總結
@@ -267,19 +236,13 @@ class cls_MainController:
             print("="*50)
 
         except DomainRuleException as dre:
-            # [P3 修正] 獨立攔截已知業務規則錯誤 (如：輸入了非資料夾)
             cls_Logger.error("業務規則", str(dre))
             cls_Logger.crit(cls_MainController.MODULE_NAME, "流程因業務規則限制而中斷。")
-            
         except InfraException as ie:
-            # [P3 修正] 獨立攔截底層設施錯誤 (如：檔案讀取失敗、寫入鎖定)
             cls_Logger.error("基礎設施", str(ie))
             cls_Logger.crit(cls_MainController.MODULE_NAME, "流程因 IO/系統層級異常而中斷。")
-            
         except Exception as e:
-            # P0 防禦線：攔截未知的系統崩潰
             cls_Logger.crit(cls_MainController.MODULE_NAME, f"發生未預期之系統崩潰: {e}")
-
         finally:
             input("\n[程式結束] 請按 Enter 鍵關閉...")
 
