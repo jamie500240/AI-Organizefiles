@@ -1,0 +1,148 @@
+import hashlib
+from pathlib import Path
+import csv
+from collections import defaultdict
+import os
+import sys
+
+# ==========================================
+# SSOT: 跨檔名比對配置
+# ==========================================
+CONFIG = {
+    "REPORT_NAME": "Archive_Verification_Report.csv",
+    "HASH_ALGO": "sha256",
+    "CHUNK_SIZE": 16384
+}
+
+# 終端機顏色
+class Color:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BLUE = '\033[94m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+class ArchiveVerifierGod:
+    def __init__(self, original_dir, archived_dir):
+        # 防禦性路徑處理
+        self.original = Path(original_dir).resolve()
+        self.archived = Path(archived_dir).resolve()
+        # 將報告產在執行目錄或原始目錄同級
+        self.report_path = self.original.parent / CONFIG["REPORT_NAME"]
+        
+        # 統計數據
+        self.stats = {"match": 0, "optimized": 0, "missing": 0, "new": 0}
+
+    def _get_hash(self, path):
+        h = hashlib.new(CONFIG["HASH_ALGO"])
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(CONFIG["CHUNK_SIZE"]), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except: return None
+
+    def _scan_to_dict(self, base_path):
+        """掃描資料夾，建立 {Hash: [檔案路徑清單]}"""
+        data = defaultdict(list)
+        all_files = list(base_path.rglob("*"))
+        total = len([f for f in all_files if f.is_file()])
+        
+        print(f"📂 掃描中: {base_path.name} (共 {total} 個檔案)")
+        
+        count = 0
+        for f in all_files:
+            if f.is_file() and f.name != CONFIG["REPORT_NAME"]:
+                f_hash = self._get_hash(f)
+                if f_hash:
+                    data[f_hash].append(str(f.relative_to(base_path)))
+                    count += 1
+                    if count % 20 == 0:
+                        print(f"  > 已讀取: {count}/{total}", end="\r")
+        print(f"\n  ✅ {base_path.name} 掃描完成。")
+        return data
+
+    def execute(self):
+        # 1. 執行掃描
+        origin_map = self._scan_to_dict(self.original)
+        archive_map = self._scan_to_dict(self.archived)
+
+        all_hashes = set(origin_map.keys()) | set(archive_map.keys())
+        
+        # 2. 寫入報告並計算統計
+        with open(self.report_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Hash 指紋 (縮寫)", "比對結果", "原始檔名", "歸檔後檔名"])
+
+            for h in sorted(all_hashes):
+                orig_files = origin_map.get(h, [])
+                arch_files = archive_map.get(h, [])
+
+                # 情況 1: 內容一致
+                if orig_files and arch_files:
+                    for o in orig_files:
+                        for a in arch_files:
+                            if o == a:
+                                status = "✅ 內容一致"
+                                self.stats["match"] += 1
+                            else:
+                                status = "💎 內容一致 (檔名已優化)"
+                                self.stats["optimized"] += 1
+                            writer.writerow([h[:8], status, o, a])
+
+                # 情況 2: 歸檔遺漏
+                elif orig_files:
+                    for o in orig_files:
+                        self.stats["missing"] += 1
+                        writer.writerow([h[:8], "❌ 歸檔遺漏", o, "---"])
+
+                # 情況 3: 歸檔新增
+                elif arch_files:
+                    for a in arch_files:
+                        self.stats["new"] += 1
+                        writer.writerow([h[:8], "➕ 歸檔新增", "---", a])
+
+        # 3. 終端機視覺化總結
+        self.display_summary()
+
+    def display_summary(self):
+        """God Interface: 終端機結果看板"""
+        print("\n" + "═"*60)
+        print(f" {Color.BOLD}{Color.BLUE}📊 檔案歸檔驗證報告 (DNA 比對模式){Color.END} ")
+        print("═"*60)
+        
+        print(f"{Color.GREEN}  ✅ 完全一致 (Match):      {self.stats['match']:>4} 檔案{Color.END}")
+        print(f"{Color.BLUE}  💎 重新命名 (Optimized):  {self.stats['optimized']:>4} 檔案{Color.END}")
+        print(f"{Color.RED}  ❌ 歸檔遺漏 (Missing):    {self.stats['missing']:>4} 檔案 (!!){Color.END}")
+        print(f"{Color.YELLOW}  ➕ 歸檔新增 (New):        {self.stats['new']:>4} 檔案{Color.END}")
+        
+        print("-" * 60)
+        print(f"📝 詳細報告已存至：{Color.BOLD}{self.report_path}{Color.END}")
+        
+        if self.stats["missing"] == 0:
+            print(f"\n{Color.GREEN}{Color.BOLD}🛡️  安全確認：所有原始檔案均已成功備份/歸檔。{Color.END}")
+        else:
+            print(f"\n{Color.RED}{Color.BOLD}⚠️  警告：尚有 {self.stats['missing']} 個檔案未出現在歸檔資料夾中！{Color.END}")
+        
+        print("═"*60)
+        input("\n[比對完成] 請按 Enter 鍵關閉...")
+
+if __name__ == "__main__":
+    # 清除畫面 (Windows/Unix)
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    print(f"{Color.BOLD}【歸檔審計 God Object】{Color.END}\n")
+    dir_o = input("1. 請輸入【原始資料夾】路徑: ").strip().strip('"')
+    dir_a = input("2. 請輸入【歸檔後資料夾】路徑: ").strip().strip('"')
+    
+    if Path(dir_o).is_dir() and Path(dir_a).is_dir():
+        verifier = ArchiveVerifierGod(dir_o, dir_a)
+        try:
+            verifier.execute()
+        except Exception as e:
+            print(f"\n{Color.RED}💥 執行失敗: {e}{Color.END}")
+            input("按 Enter 結束...")
+    else:
+        print(f"{Color.RED}❌ 路徑錯誤，請確認資料夾存在。{Color.END}")
+        input("按 Enter 結束...")
