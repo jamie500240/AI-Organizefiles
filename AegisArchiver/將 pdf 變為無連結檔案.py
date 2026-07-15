@@ -5,7 +5,7 @@
 # IMPORTS: os, csv, shutil, sys, pathlib, datetime, pikepdf, tqdm, logging, hashlib
 # FORBIDDEN: 禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動
 # DEPENDENCIES: pikepdf, tqdm
-# VERSION: 1.0.0 [Stability: Stable]
+# VERSION: 1.1.0 [Stability: Stable]
 # ==========================================================
 
 import os
@@ -27,7 +27,6 @@ CONFIG = {
 }
 
 class AuditLogFormatter(logging.Formatter):
-    """自訂 Formatter，嚴格對齊第十六章日誌標籤規範 (WARN/CRIT)"""
     def format(self, record):
         mapping = {'WARNING': 'WARN', 'CRITICAL': 'CRIT'}
         original_levelname = record.levelname
@@ -92,8 +91,11 @@ class AegisArchiver:
                 raise IOError(f"SHA-256 mismatch during move. Aborting deletion of original file: {src.name}")
         except Exception as e:
             if dst.exists():
-                os.remove(dst)
-                self.logger.info(f"Cleaned up partial/corrupted target file at: {dst}")
+                try:
+                    os.remove(dst)
+                    self.logger.info(f"Cleaned up partial/corrupted target file at: {dst}")
+                except Exception as clean_e:
+                    self.logger.warning(f"Failed to clean target file {dst}: {clean_e}")
             raise e
 
     def handle_pdf(self, path):
@@ -120,13 +122,11 @@ class AegisArchiver:
                     pdf.save(safe_path)
 
             if is_risky:
-                # 實體隔離原檔
                 self.infected_zone.mkdir(exist_ok=True)
                 inf_path = self._get_unique_path(self.infected_zone, path.name)
                 self._verified_move(path, inf_path)
                 self.logger.info(f"Original risky file verified and isolated: {inf_path}")
                 
-                # 於安全區生成溯源佔位符 (Placeholder)
                 with open(placeholder_path, "w", encoding="utf-8") as f:
                     f.write("[FILE QUARANTINED] 檔案已被隔離\n")
                     f.write("====================================\n")
@@ -143,20 +143,30 @@ class AegisArchiver:
         except Exception as e:
             self.logger.error(f"Processing failed for {path.name}: {str(e)}")
             
-            # 清理孤兒檔，確保 SSOT 完整性 (包含 PDF 與佔位符)
             if safe_path.exists():
-                os.remove(safe_path)
-                self.logger.info(f"Cleaned up orphaned safe file for {path.name} after processing failure.")
+                try:
+                    os.remove(safe_path)
+                    self.logger.info(f"Cleaned up orphaned safe file for {path.name} after processing failure.")
+                except Exception as clean_e:
+                    self.logger.warning(f"Failed to clean orphaned safe file {safe_path}: {clean_e}")
+                    
             if placeholder_path.exists():
-                os.remove(placeholder_path)
-                self.logger.info(f"Cleaned up orphaned placeholder file for {path.name}.")
+                try:
+                    os.remove(placeholder_path)
+                    self.logger.info(f"Cleaned up orphaned placeholder file for {path.name}.")
+                except Exception as clean_e:
+                    self.logger.warning(f"Failed to clean orphaned placeholder {placeholder_path}: {clean_e}")
 
             self.failed_zone.mkdir(exist_ok=True)
             
             if path.exists():
                 fail_path = self._get_unique_path(self.failed_zone, path.name)
-                shutil.copy2(path, fail_path)
-                final_record_path = fail_path
+                try:
+                    shutil.copy2(path, fail_path)
+                    final_record_path = fail_path
+                except Exception as copy_e:
+                    final_record_path = "[LOCKED_OR_UNREADABLE]"
+                    self.logger.error(f"Failed to copy locked/unreadable file {path.name}: {copy_e}")
             else:
                 final_record_path = "[FILE_LOST_DURING_PROCESS]"
                 self.logger.error(f"Source file {path.name} lost before failure fallback could execute.")
@@ -174,7 +184,16 @@ class AegisArchiver:
 
         for f in tqdm(files, desc="Processing Files", ascii=True):
             ext = f.suffix.lower()
-            size_mb = round(os.path.getsize(f) / (1024 * 1024), 2)
+            size_mb = 0.0
+            
+            # 【P2 修復】I/O 前置檢查：阻斷因 getsize 引發的全域崩潰
+            try:
+                size_mb = round(os.path.getsize(f) / (1024 * 1024), 2)
+            except Exception as e:
+                self.logger.error(f"Pre-process I/O failed for {f.name}: {str(e)}")
+                self.stats["FAILED"] += 1
+                self.log_data.append([f.name, f.parent, size_mb, "FAILED", f"I/O Probe Failed: {str(e)}", "[LOCKED_OR_LOST_PRE_PROCESS]"])
+                continue
             
             if ext == ".pdf":
                 res, det, final_p = self.handle_pdf(f)
@@ -183,10 +202,37 @@ class AegisArchiver:
                 else: self.stats["PDF"] += 1
             else:
                 final_p = self._get_unique_path(self.safe_zone, f.name)
-                shutil.copy2(f, final_p)
-                res, det = "SUCCESS", "Standard copy"
-                self.stats["SAFE"] += 1
-                self.logger.info(f"File safely archived: {f.name}")
+                try:
+                    shutil.copy2(f, final_p)
+                    res, det = "SUCCESS", "Standard copy"
+                    self.stats["SAFE"] += 1
+                    self.logger.info(f"File safely archived: {f.name}")
+                except Exception as e:
+                    self.logger.error(f"Copy failed for {f.name}: {str(e)}")
+                    self.failed_zone.mkdir(exist_ok=True)
+                    
+                    if final_p.exists():
+                        try:
+                            os.remove(final_p)
+                            self.logger.info(f"Cleaned up partial safe file for {f.name}.")
+                        except Exception as clean_e:
+                            self.logger.warning(f"Failed to clean partial safe file {final_p}: {clean_e}")
+                    
+                    if f.exists():
+                        fail_path = self._get_unique_path(self.failed_zone, f.name)
+                        try:
+                            shutil.copy2(f, fail_path)
+                            final_p = fail_path
+                            det = f"Copy Failed (Backed up): {str(e)}"
+                        except Exception as copy_e:
+                            final_p = "[LOCKED_OR_UNREADABLE]"
+                            det = f"Critical Failure (Cannot copy): {str(copy_e)}"
+                    else:
+                        final_p = "[FILE_LOST_DURING_PROCESS]"
+                        det = f"Source lost: {str(e)}"
+                        
+                    res = "FAILED"
+                    self.stats["FAILED"] += 1
             
             self.log_data.append([f.name, f.parent, size_mb, res, det, final_p])
 
