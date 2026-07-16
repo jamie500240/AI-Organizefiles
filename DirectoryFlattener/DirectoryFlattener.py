@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE: Script_DirectoryFlattener
+# MODULE: DirectoryFlattener
 # PURPOSE: 自動扁平化目標資料夾，具備兩階段驗證搬移、內容雜湊比對與安全復原機制
 # EXPORTS: flatten_and_report
 # IMPORTS: os, shutil, csv, datetime, hashlib, logging
