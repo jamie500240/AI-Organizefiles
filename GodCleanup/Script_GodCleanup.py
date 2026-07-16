@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE:       Script_GodCleanup_v2.1.4 (Final Edition)
+# MODULE:       Script_GodCleanup
 # PURPOSE:      檔案清理與去重自動化核心 (嚴格遵守 ACDS 合約)
 # EXPORTS:      Script_AppRouter.run()
 # IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
@@ -7,10 +7,10 @@
 # DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
 # VERSION:      2.1.4 [Stability: Stable]
 #
-# [ADR-001] 關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
-# Context:  本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
-# Decision: 遭遇 Ctrl+C (KeyboardInterrupt) 時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
-# Rationale:在巨量檔案處理情境下，銷毀數小時的成功進度會造成極差的 UX。保留 Partial State 並透過 CSV 報表確保資料狀態具備完全的可稽核性，為此情境下之最佳實務。
+# [ADR-001]     關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
+# Context:      本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
+# Decision:     遭遇 Ctrl+C (KeyboardInterrupt) 時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
+# Rationale:    在巨量檔案處理情境下，銷毀數小時的成功進度會造成極差的 UX。保留 Partial State 並透過 CSV 報表確保資料狀態具備完全的可稽核性，為此情境下之最佳實務。
 # ==========================================================
 
 import os
