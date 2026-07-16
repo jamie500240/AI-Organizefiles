@@ -5,7 +5,7 @@
 # IMPORTS:      os, csv, shutil, sys, pathlib, datetime, pikepdf, tqdm, logging, hashlib
 # FORBIDDEN:    禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動
 # DEPENDENCIES: pikepdf, tqdm
-# VERSION:      1.1.0 [Stability: Stable]
+# VERSION:      1.1.0 [Stability: Experimental]
 # ==========================================================
 
 import os
