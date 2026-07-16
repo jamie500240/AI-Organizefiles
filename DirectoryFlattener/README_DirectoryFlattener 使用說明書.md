@@ -1,4 +1,4 @@
-# 📂 Script_DirectoryFlattener (資料夾扁平化工具)
+# 📂 DirectoryFlattener (資料夾扁平化工具)
 
 本工具旨在將指定資料夾內的「所有子目錄檔案」集中提取至該資料夾的根層級（即「扁平化」），並自動刪除已清空的子目錄。
 
