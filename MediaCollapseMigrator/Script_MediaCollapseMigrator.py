@@ -176,7 +176,7 @@ class Script_MediaCollapseMigrator:
             return {"file": fpath, "is_img": False, "error": str(e), "failed": True}
 
     def execute(self):
-        logging.info("啟動 Script_MediaCollapseMigrator (V3.0.0)。DNA 分析與分發模式運轉中...")
+        logging.info("啟動 Script_MediaCollapseMigrator (V1.0.0)。DNA 分析與分發模式運轉中...")
         all_files = [f for f in self.root.rglob("*") if f.is_file()]
         
         with ThreadPoolExecutor() as exc:
