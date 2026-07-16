@@ -1,4 +1,4 @@
-# Script_MediaCollapseMigrator (自動整理圖片)
+# 📁 Script_MediaCollapseMigrator (自動整理圖片)
 ## 大量照片依日期/人物分類，並拍平瑣碎的空目錄
 **版本**: 1.0.0 [Experimental]
 
