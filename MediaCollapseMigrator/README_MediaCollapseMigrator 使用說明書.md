@@ -39,7 +39,7 @@ pip install Pillow numpy tqdm
 
 1. 在終端機或命令提示字元中執行：
 ```bash
-python Mod_MediaCollapseMigrator.py
+python Script_MediaCollapseMigrator.py
 
 ```
 
