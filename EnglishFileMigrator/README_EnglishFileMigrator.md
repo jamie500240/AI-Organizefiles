@@ -1,4 +1,6 @@
-# 📂 Script_EnglishFileMigrator (分流中英文檔案 / 英文檔案自動化移轉系統)
+# 📂 Script_EnglishFileMigrator (英文檔案自動化移轉系統)
+## 依內容語系自動把英文檔案分流到獨立資料夾
+
 
 **版本:** v2.0.0 [Experimental]
 
