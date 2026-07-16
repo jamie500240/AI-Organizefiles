@@ -5,7 +5,7 @@
 # IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
 # FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
 # DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
-# VERSION:      2.1.4 [Stability: Stable]
+# VERSION:      2.1.4 [Stability: Experimental]
 #
 # [ADR-001]     關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
 # Context:      本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
