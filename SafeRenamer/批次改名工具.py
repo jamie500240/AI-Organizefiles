@@ -1,20 +1,19 @@
 # ==========================================================
 # MODULE:      Script_SafeRenamer
 # PURPOSE:     安全批次改名工具：支援雙模式 (改名/復原)、外部 JSON 設定檔動態載入
-# EXPORTS:     RenameFlow, RevertFlow, RuleFactory, NameProcessor
-# IMPORTS:     os, shutil, tkinter, pathlib, dataclasses, typing, re, datetime, json
+# EXPORTS:     RenameFlow, RevertFlow, RuleFactory, NameProcessor, FileOps
+# IMPORTS:     os, shutil, tkinter, pathlib, dataclasses, typing, re, datetime, json, hashlib
 # FORBIDDEN:   禁止對「原始輸入檔案」(source_dir 內的檔案)執行 move 或 rename；
 #              禁止靜默吞沒例外 (except: pass)。
 #              例外：RevertFlow 依 ADR-007，對「成功區內部」已複製完成的檔案
 #              執行 rename()，此為同資料夾內部操作，不受本條限制。
 # DEPENDENCIES: 內建標準庫為主。EXIF 功能需額外安裝 `pip install pillow`
-# VERSION:     3.0.0 [Stability: Experimental ]
-# ADR-005:     引入 RuleFactory 動態載入 JSON 建立管線，若未提供 JSON 則退回程式內建 PIPELINE。
-# ADR-006:     引入 RevertFlow 復原機制，確保具備 100% 狀態回滾能力。
-# ADR-007:     RevertFlow 中的還原操作採用 OS 原生 rename()。因來源與目的皆在同資料夾
-#              (同磁碟區)，其原子性由底層檔案系統保證，故不套用「先複製、驗證、再刪除」
-#              流程以優化效能。此為 Manifest FORBIDDEN 條款之明文例外，範圍僅限
-#              「成功區內部」，不適用於任何對 source_dir 原始檔案的操作。
+# VERSION:     3.1.0 [Stability: Experimental ]
+# ADR-005:     引入 RuleFactory 動態載入 JSON 建立管線，若未提供 JSON 則退回內建 PIPELINE。
+# ADR-006:     引入 RevertFlow 復原機制。在 RenameFlow 實作 try...finally，確保遭逢
+#              強制中斷 (Ctrl+C) 時，時光機地圖必定落地，並清除未驗證的殘檔，落實 100% 可回滾。
+# ADR-007:     RevertFlow 中的還原採用 OS 原生 rename()，原子性由底層保證，不套用複製刪除。
+# ADR-008:     檔案驗證全面升級為 SHA256 雜湊比對；Sanitization 升級同步攔截 Windows 保留字。
 # ==========================================================
 
 import os
@@ -22,6 +21,7 @@ import shutil
 import tkinter as tk
 import re
 import json
+import hashlib
 from tkinter import filedialog
 from pathlib import Path
 from dataclasses import dataclass
@@ -138,10 +138,8 @@ class RuleFactory:
             params = item.get("params", {})
             
             if rule_name is None:
-                # 純註解／Phase 標題物件，不是規則設定，靜默略過
                 continue
             if rule_name.startswith("X"):
-                # 使用者以 X 前綴主動停用，非錯誤，僅記錄資訊層級訊息
                 print(f"[停用] {rule_name[1:]} 已被使用者以 X 前綴停用。")
                 continue
                 
@@ -165,9 +163,17 @@ class AppConfig:
 CONFIG = AppConfig()
 
 class NameProcessor:
+    RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", 
+                      "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", 
+                      "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
     @staticmethod
     def sanitize_filename(filename: str) -> str:
-        return re.sub(r'[<>:"/\\|?*]', '_', filename)
+        cleaned = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        stem, ext = os.path.splitext(cleaned)
+        if stem.upper() in NameProcessor.RESERVED_NAMES:
+            cleaned = f"_{stem}{ext}"
+        return cleaned
 
     @staticmethod
     def generate_new_name(original_path: Path, pipeline: List[RenameRule], logger: "Logger | None" = None) -> str:
@@ -177,6 +183,14 @@ class NameProcessor:
         return NameProcessor.sanitize_filename(current_name)
 
 class FileOps:
+    @staticmethod
+    def calculate_sha256(file_path: Path) -> str:
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(8192):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
+
     @staticmethod
     def get_safe_target_path(target_dir: Path, new_name: str, used_names: Set[str]) -> Path:
         name_part, ext_part = os.path.splitext(new_name)
@@ -255,31 +269,44 @@ class RenameFlow:
         
         revert_data = {"success_dir": str(success_dir.resolve()), "files": {}}
         success_count, fail_count = 0, 0
-
-        for orig_path, new_name in plan:
-            tgt_path = success_dir / new_name
-            try:
-                shutil.copy2(orig_path, tgt_path)
-                if orig_path.stat().st_size != tgt_path.stat().st_size:
-                    tgt_path.unlink(missing_ok=True)
-                    raise IOError("驗證失敗：大小不符，已清除殘檔。")
-                
-                logger.write(f"[SUCCESS] {orig_path.name} -> {new_name}")
-                revert_data["files"][new_name] = orig_path.name 
-                success_count += 1
-            except Exception as e:
-                logger.write(f"[FAIL] {orig_path.name} | Error: {e}")
-                fail_count += 1
-                try: shutil.copy2(orig_path, fail_dir / orig_path.name)
-                except Exception as ne: print(f"[CRITICAL] 備份失敗: {ne}")
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         revert_map_filename = f"{CONFIG.REVERT_MAP_PREFIX}{timestamp}.json"
-        
-        with open(self.target_dir / revert_map_filename, 'w', encoding='utf-8') as f:
-            json.dump(revert_data, f, ensure_ascii=False, indent=2)
 
-        print(f"\n✅ 完成！成功: {success_count}。時光機地圖已生成至 {revert_map_filename}")
+        try:
+            for orig_path, new_name in plan:
+                tgt_path = success_dir / new_name
+                file_completed = False
+                
+                try:
+                    shutil.copy2(orig_path, tgt_path)
+                    
+                    if FileOps.calculate_sha256(orig_path) != FileOps.calculate_sha256(tgt_path):
+                        tgt_path.unlink(missing_ok=True)
+                        raise IOError("驗證失敗：SHA256 雜湊值不符，已清除殘檔。")
+                    
+                    logger.write(f"[SUCCESS] {orig_path.name} -> {new_name}")
+                    revert_data["files"][new_name] = orig_path.name 
+                    success_count += 1
+                    file_completed = True
+
+                except KeyboardInterrupt:
+                    if not file_completed:
+                        tgt_path.unlink(missing_ok=True)
+                        print(f"\n[中斷防護] 已清除未驗證的殘檔: {tgt_path.name}")
+                    raise 
+
+                except Exception as e:
+                    logger.write(f"[FAIL] {orig_path.name} | Error: {e}")
+                    fail_count += 1
+                    try: shutil.copy2(orig_path, fail_dir / orig_path.name)
+                    except Exception as ne: print(f"[CRITICAL] 備份失敗: {ne}")
+        finally:
+            if revert_data["files"]:
+                with open(self.target_dir / revert_map_filename, 'w', encoding='utf-8') as f:
+                    json.dump(revert_data, f, ensure_ascii=False, indent=2)
+                print(f"\n[狀態保存] 已將 {len(revert_data['files'])} 筆時光機紀錄落地至 {revert_map_filename}")
+
+        print(f"\n✅ 執行結束！成功: {success_count}，失敗: {fail_count}。")
 
 # ==========================================
 # FLOW 2: Revert Mode (時光機模式)
@@ -329,7 +356,6 @@ class RevertFlow:
                     safe_restore_path = success_dir / f"{restore_path.stem}_revert{counter}{restore_path.suffix}"
                     counter += 1
                 
-                # ADR-007: OS 原生同資料夾更名
                 current_path.rename(safe_restore_path)
                 logger.write(f"[REVERT_SUCCESS] {current_path.name} -> {safe_restore_path.name}")
                 success_count += 1
@@ -348,7 +374,7 @@ def main():
     root.withdraw()
     
     print("========================================")
-    print("      Script SafeRenamer v3.0.0")
+    print("      Script SafeRenamer v3.1.0")
     print("========================================")
     print("[1] 執行批次改名 (使用 JSON 或內建設定)")
     print("[2] 啟動時光機 (讀取 revert_map 還原檔名)")
@@ -366,6 +392,8 @@ def main():
             RevertFlow().execute()
         else:
             print("無效選項，程式結束。")
+    except KeyboardInterrupt:
+        print("\n\n[中斷] 偵測到強制中斷 (Ctrl+C)，系統已介入處理。")
     except Exception as e:
         print(f"\n[系統錯誤] {e}")
     finally:
