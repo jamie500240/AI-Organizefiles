@@ -8,7 +8,7 @@
 #              例外：RevertFlow 依 ADR-007，對「成功區內部」已複製完成的檔案
 #              執行 rename()，此為同資料夾內部操作，不受本條限制。
 # DEPENDENCIES: 內建標準庫為主。EXIF 功能需額外安裝 `pip install pillow`
-# VERSION:     3.1.0 [Stability: Experimental ]
+# VERSION:     3.1.0 [Stability: Experimental]
 # ADR-005:     引入 RuleFactory 動態載入 JSON 建立管線，若未提供 JSON 則退回內建 PIPELINE。
 # ADR-006:     引入 RevertFlow 復原機制。在 RenameFlow 實作 try...finally，確保遭逢
 #              強制中斷 (Ctrl+C) 時，時光機地圖必定落地，並清除未驗證的殘檔，落實 100% 可回滾。
