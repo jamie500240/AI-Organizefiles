@@ -1,11 +1,11 @@
 # ==========================================================
-# MODULE: DirectoryFlattener
-# PURPOSE: 自動扁平化目標資料夾，具備兩階段驗證搬移、內容雜湊比對與安全復原機制
-# EXPORTS: flatten_and_report
-# IMPORTS: os, shutil, csv, datetime, hashlib, logging
-# FORBIDDEN: 禁止使用未驗證的 shutil.move 進行跨目錄轉移；禁止忽略可能的檔案權限或系統檔案錯誤；禁止缺乏 Rollback 機制的批次修改。
+# MODULE:       Script_DirectoryFlattener
+# PURPOSE:      自動扁平化目標資料夾，具備兩階段驗證搬移、內容雜湊比對與安全復原機制
+# EXPORTS:      flatten_and_report
+# IMPORTS:      os, shutil, csv, datetime, hashlib, logging
+# FORBIDDEN:    禁止使用未驗證的 shutil.move 進行跨目錄轉移；禁止忽略可能的檔案權限或系統檔案錯誤；禁止缺乏 Rollback 機制的批次修改。
 # DEPENDENCIES: 僅依賴 Python 標準庫 (Standard Library)
-# VERSION: 1.0.0 [Stability: Experimental]
+# VERSION:      1.0.0 [Stability: Experimental]
 # ==========================================================
 
 import os
