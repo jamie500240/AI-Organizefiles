@@ -174,7 +174,7 @@ def flatten_and_report(target_dir):
             print(f"報表產生失敗: {e}")
 
 if __name__ == "__main__":
-    print("=== Script_DirectoryFlattener v1.0.1 (Experimental) ===")
+    print("=== Script_DirectoryFlattener v1.0.0 (Experimental) ===")
     
     path_input = input("請輸入或拖入要拍扁的資料夾路徑: ").strip('"').strip("'")
     
