@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE:       EnglishFileMigrator
+# MODULE:       Script_EnglishFileMigrator
 # PURPOSE:      自動掃描指定資料夾，判定語系並安全移轉英文檔案至專屬目錄，同時生成溯源對照表
 # EXPORTS:      EnglishFileMigrator
 # IMPORTS:      os, shutil, csv, hashlib, logging, datetime, pathlib, docx, pdfminer, pptx, openpyxl, pytesseract, PIL
