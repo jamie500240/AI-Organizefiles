@@ -1,7 +1,7 @@
 # ==========================================================
 # MODULE:       Script_AegisArchiver
 # PURPOSE:      自動掃描指定資料夾，執行資安檢測。安全檔案予以去毒引渡；風險檔案移至隔離區，並於安全區留下溯源佔位符。
-# EXPORTS:      AegisArchiver
+# EXPORTS:      Script_AegisArchiver
 # IMPORTS:      os, csv, shutil, sys, pathlib, datetime, pikepdf, tqdm, logging, hashlib
 # FORBIDDEN:    禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動
 # DEPENDENCIES: pikepdf, tqdm
@@ -35,7 +35,7 @@ class AuditLogFormatter(logging.Formatter):
         record.levelname = original_levelname
         return result
 
-class AegisArchiver:
+class Script_AegisArchiver:
     def __init__(self, src_path):
         self.src = Path(src_path).resolve()
         ts = datetime.now().strftime('%m%d_%H%M%S')
@@ -52,7 +52,7 @@ class AegisArchiver:
         self._setup_logger()
 
     def _setup_logger(self):
-        self.logger = logging.getLogger("AegisArchiver")
+        self.logger = logging.getLogger("Script_AegisArchiver")
         self.logger.setLevel(logging.DEBUG)
         
         fh = logging.FileHandler(self.safe_zone / CONFIG["LOG_FILE"], encoding="utf-8")
@@ -61,7 +61,7 @@ class AegisArchiver:
         formatter = AuditLogFormatter('[%(levelname)s] %(asctime)s %(name)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         fh.setFormatter(formatter)
         self.logger.addHandler(fh)
-        self.logger.info("AegisArchiver initialized. Safe zone created.")
+        self.logger.info("Script_AegisArchiver initialized. Safe zone created.")
 
     def _get_unique_path(self, target_dir, filename):
         base = target_dir / filename
@@ -265,6 +265,6 @@ class AegisArchiver:
 if __name__ == "__main__":
     p = input("Enter source directory path: ").strip().strip('"')
     if os.path.isdir(p):
-        AegisArchiver(p).execute()
+        Script_AegisArchiver(p).execute()
     else:
         print("Error: Invalid directory path.")
