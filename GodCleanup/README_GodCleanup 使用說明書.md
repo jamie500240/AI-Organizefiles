@@ -1,4 +1,4 @@
-# 📁 Script_GodCleanup (檔案清理與去重自動化) 使用說明書
+# 📁 Script_GodCleanup (檔案清理與去重自動化)
 ## 大量檔案去重歸檔，含容量預估與模擬執行
 
 
