@@ -1,4 +1,4 @@
-# 🧬 VBA 歷史定序引擎 / 幫雜亂的 VBA 定出時間序 (VBA History Sequencer)
+# 🧬 VBA History Sequencer (幫雜亂的 VBA 定出時間序)
 
 **版本：** 1.1.0 [Experimental]
 
