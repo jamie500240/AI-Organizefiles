@@ -1,16 +1,19 @@
 # ==========================================================
 # MODULE:       Script_VBAHistorySequencer
-# PURPOSE:      VBA 歷史版本分析與模組血緣追蹤
+# PURPOSE:      VBA 歷史版本分析與模組血緣追蹤 (Office 跨平台版)
 # EXPORTS:      Pipeline.run()
 # IMPORTS:      os, sys, shutil, hashlib, pathlib, datetime, tkinter, csv, zipfile
 # FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
 # DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
-# VERSION:      1.1.0 [Stability: Experimental]
+# VERSION:      1.2.0 [Stability: Experimental]
 #
 # [ADR-001] 關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
 # Context:  本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
 # Decision: 遭遇 Ctrl+C (KeyboardInterrupt) 或單一檔案 I/O 異常時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
 # Rationale:在巨量檔案處理情境下，銷毀數小時的成功進度會造成極差的 UX。保留 Partial State 並透過 CSV 報表確保資料狀態具備完全的可稽核性，為此情境下之最佳實務。
+# [ADR-002] 關於 增加可處理物件的原因
+# Context:  本系統處理之目標只能是 EXCEL 不夠泛用。
+# Decision: 開放 WORD 跟 PPT 都可用。
 # ==========================================================
 
 import os
@@ -34,7 +37,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 @dataclass(frozen=True)
 class AppConfig:
     SHA_LEN: int = 16
-    EXCEL_EXTS: tuple = ('.xls', '.xlsx', '.xlsm', '.xlsb')
+    # 【擴展】支援所有主流 Office 巨集格式
+    OFFICE_EXTS: tuple = ('.xls', '.xlsx', '.xlsm', '.xlsb', '.doc', '.docm', '.ppt', '.pptm')
     ILLEGAL_CHAR_PATTERN: str = r'[\\/*?:"<>|]'
     RESERVED_NAMES_PATTERN: str = r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$'
     
@@ -42,7 +46,8 @@ class AppConfig:
     MAX_WORKERS: int = 4
     TIMEOUT_ANCHOR_SEC: float = 15.0
     TIMEOUT_PER_FILE_SEC: float = 10.0
-    MAX_LEGACY_XLS_MB: float = 20.0
+    # 【防禦】泛化 OLE 舊檔記憶體保護，防止 .doc, .ppt, .xls 造成 OOM
+    MAX_LEGACY_MB: float = 20.0
     MAX_VBA_CODE_LENGTH: int = 2 * 1024 * 1024  # 2MB 字元上限 (防止 OOM)
 
 @dataclass(frozen=True)
@@ -94,7 +99,7 @@ class EvolutionNode:
 @dataclass
 class ProcessPayload:
     source_dir: Path
-    output_dir: Path = None  # 新增輸出目錄欄位
+    output_dir: Path = None  
     anchor_file: Path = None
     config: AppConfig = field(default_factory=AppConfig)
     strings: AppStrings = field(default_factory=AppStrings)
@@ -153,7 +158,8 @@ class VbaExtractor:
         vba_parser = None
         suffix = file_path.suffix.lower()
         
-        if suffix in ('.xlsm', '.xlsb', '.xlsx'):
+        # 【擴展】加入 .docm 與 .pptm 支援 ZIP 結構解析
+        if suffix in ('.xlsm', '.xlsb', '.xlsx', '.docm', '.pptm'):
             try:
                 with zipfile.ZipFile(file_path, 'r') as z:
                     vba_target = next((name for name in z.namelist() if name.lower().endswith('vbaproject.bin')), None)
@@ -177,8 +183,9 @@ class VbaExtractor:
 
         try:
             file_size_mb = file_path.stat().st_size / (1024 * 1024)
-            if suffix == '.xls' and file_size_mb > config.MAX_LEGACY_XLS_MB:
-                return False, {}, {}, f"Legacy .xls file too large ({file_size_mb:.1f}MB). Skipped to protect memory."
+            # 【防禦】泛化為對所有舊版 OLE 檔案進行記憶體保護
+            if suffix in ('.xls', '.doc', '.ppt') and file_size_mb > config.MAX_LEGACY_MB:
+                return False, {}, {}, f"Legacy file '{suffix}' too large ({file_size_mb:.1f}MB). Skipped to protect memory."
 
             with open(file_path, 'rb') as f:
                 file_bytes = f.read()
@@ -209,9 +216,10 @@ class ActionPreScanAndSequence(IAction):
         engine_name = "RapidFuzz (極速模式)" if HAS_RAPIDFUZZ else "Difflib (標準模式)"
         print(f"\n🧬 [階段 1/4] 啟動模組比對與演化定序 | 載入引擎: {engine_name}")
         
-        target_files = [f for f in payload.source_dir.glob('*') if f.is_file() and f.suffix.lower() in payload.config.EXCEL_EXTS]
+        # 改採 OFFICE_EXTS 過濾器
+        target_files = [f for f in payload.source_dir.rglob('*') if f.is_file() and f.suffix.lower() in payload.config.OFFICE_EXTS]
         if not target_files:
-            raise ValueError("找不到任何 Excel 檔案。")
+            raise ValueError("找不到任何支援的 Office 檔案。")
 
         print("🔍 正在解析錨點檔案...")
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -262,8 +270,8 @@ class ActionPreScanAndSequence(IAction):
         
         for generation, node in enumerate(valid_nodes, 1):
             node.generation = generation
-            safe_excel_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
-            node.folder_name = f"Gen{generation:03d}_{node.similarity_score:05.1f}%_{safe_excel_name}"
+            safe_file_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
+            node.folder_name = f"Gen{generation:03d}_{node.similarity_score:05.1f}%_{safe_file_name}"
             
         return payload
 
@@ -271,7 +279,6 @@ class ActionInitializeWorkspace(IAction):
     def execute(self, payload: ProcessPayload) -> ProcessPayload:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # 依賴使用者指定的輸出目錄，不再污染 __file__ 所在目錄
         base_dir = payload.output_dir if payload.output_dir else Path.cwd()
         
         payload.final_dir = base_dir / f"{payload.strings.DIR_WORKSPACE_PREFIX}_{timestamp}"
@@ -301,7 +308,7 @@ class ActionExtractAndStage(IAction):
             
             for node in sorted_nodes:
                 try:
-                    safe_excel_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
+                    safe_file_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
                     
                     if not node.is_valid:
                         payload.stats["failed"] += 1
@@ -310,7 +317,7 @@ class ActionExtractAndStage(IAction):
                         except Exception as copy_err:
                             node.error_msg += f" (I/O Error: {copy_err})"
                         
-                        csv_writer.writerow(["N/A", "N/A", safe_excel_name, "N/A", "N/A", payload.strings.STATUS_FAIL, node.error_msg])
+                        csv_writer.writerow(["N/A", "N/A", safe_file_name, "N/A", "N/A", payload.strings.STATUS_FAIL, node.error_msg])
                         f.flush()
                         continue
                         
@@ -319,7 +326,7 @@ class ActionExtractAndStage(IAction):
                         node.is_clone = True
                         payload.stats["clones"] += 1
                         shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_CLONES / node.file_path.name)
-                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_excel_name, "[ALL_MODULES]", "N/A", payload.strings.STATUS_CLONE, "100% 基因重疊，已下放 CLONES 隔離區"])
+                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_file_name, "[ALL_MODULES]", "N/A", payload.strings.STATUS_CLONE, "100% 基因重疊，已下放 CLONES 隔離區"])
                         f.flush()
                         continue
                         
@@ -352,16 +359,16 @@ class ActionExtractAndStage(IAction):
                         with open(node_target_dir / final_mod_name, "w", encoding="utf-8") as out_f:
                             out_f.write(vba_code)
                             
-                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_excel_name, safe_mod_name, sha_short, status, ""])
+                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_file_name, safe_mod_name, sha_short, status, ""])
                     
                     f.flush()
                 
                 except Exception as file_io_err:
                     payload.stats["failed"] += 1
-                    fallback_excel_name = str(node.file_path.name) if node.file_path else "UNKNOWN_FILE"
+                    fallback_file_name = str(node.file_path.name) if node.file_path else "UNKNOWN_FILE"
                     
                     err_str = f"檔案處理異常 ({type(file_io_err).__name__}): {file_io_err}"
-                    csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", fallback_excel_name, "N/A", "N/A", payload.strings.STATUS_FAIL, err_str])
+                    csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", fallback_file_name, "N/A", "N/A", payload.strings.STATUS_FAIL, err_str])
                     f.flush()
                     
                     try:
@@ -413,80 +420,75 @@ if __name__ == "__main__":
     import tkinter as tk
     from tkinter import filedialog
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    
-    print("\n" + "="*60)
-    print(" 🧬 VBA 歷史定序引擎 啟動")
-    print("="*60)
-    
-    # 1. 選擇全庫來源
-    target_folder = filedialog.askdirectory(title="【1. 選擇全庫來源】請選擇包含所有檔案的資料夾")
-    if not target_folder: 
-        print("已取消操作。")
-        sys.exit(0)
+    initial_payload = None  # 先宣告，避免 finally 引用時 NameError
 
-    # 2. 指定進化終點
-    anchor_file = filedialog.askopenfilename(
-        title="【2. 指定進化終點】請選擇「最終定稿」的 Excel 檔案",
-        initialdir=target_folder,
-        filetypes=[("Excel Files", "*.xls*")]
-    )
-    if not anchor_file:
-        print("必須指定最終定稿才能進行演化反推。")
-        sys.exit(0)
-
-    # 3. 指定輸出位置 (預設為來源目錄的上一層，避免污染 Repo)
-    default_out_dir = str(Path(target_folder).parent)
-    output_folder = filedialog.askdirectory(
-        title="【3. 選擇輸出位置】請選擇分析報告與提取檔案的儲存目錄",
-        initialdir=default_out_dir
-    )
-    if not output_folder:
-        print("未指定輸出路徑，已取消操作。")
-        sys.exit(0)
-
-    # 釋放 UI 資源
-    root.destroy()
-
-    cleanup_flow = Pipeline([
-        ActionPreScanAndSequence(),
-        ActionInitializeWorkspace(),
-        ActionExtractAndStage(),
-        ActionCommitAndFinalize()
-    ])
-
-    initial_payload = ProcessPayload(
-        source_dir=Path(target_folder), 
-        anchor_file=Path(anchor_file),
-        output_dir=Path(output_folder)  # 將自訂輸出路徑封裝進 Payload
-    )
-    
     try:
-        start_time = time()
-        final_result = cleanup_flow.run(initial_payload)
-        
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+
         print("\n" + "="*60)
-        print(f"✅ 歷史時光機重建完畢 (耗時: {time() - start_time:.2f} 秒)")
-        print(f"📊 突變/首創模組 (MUTATION): {final_result.stats['mutations']}")
-        print(f"📊 沿用舊有模組 (INHERITED): {final_result.stats['inherited']}")
-        print(f"👻 隔離純複製體 (CLONES): {final_result.stats['clones']} 個檔案")
-        if final_result.stats['failed'] > 0:
-            print(f"⚠️ 解析失敗隔離 (FAILED): {final_result.stats['failed']} 個檔案")
-        print(f"📂 本次輸出父夾: {final_result.final_dir}")
+        print(" 🧬 Office VBA 歷史定序引擎 啟動")
         print("="*60)
-        
+
+        target_folder = filedialog.askdirectory(title="【1. 選擇全庫來源】請選擇包含所有檔案的資料夾")
+        if not target_folder:
+            print("已取消操作。")
+        else:
+            anchor_file = filedialog.askopenfilename(
+                title="【2. 指定進化終點】請選擇「最終定稿」的 Office 檔案",
+                initialdir=target_folder,
+                filetypes=[("Office Macros", "*.xls* *.doc* *.ppt*"), ("All Files", "*.*")]
+            )
+            if not anchor_file:
+                print("必須指定最終定稿才能進行演化反推。")
+            else:
+                default_out_dir = str(Path(target_folder).parent)
+                output_folder = filedialog.askdirectory(
+                    title="【3. 選擇輸出位置】請選擇分析報告與提取檔案的儲存目錄",
+                    initialdir=default_out_dir
+                )
+                if not output_folder:
+                    print("未指定輸出路徑，已取消操作。")
+                else:
+                    root.destroy()
+
+                    cleanup_flow = Pipeline([
+                        ActionPreScanAndSequence(),
+                        ActionInitializeWorkspace(),
+                        ActionExtractAndStage(),
+                        ActionCommitAndFinalize()
+                    ])
+
+                    initial_payload = ProcessPayload(
+                        source_dir=Path(target_folder),
+                        anchor_file=Path(anchor_file),
+                        output_dir=Path(output_folder)
+                    )
+
+                    start_time = time()
+                    final_result = cleanup_flow.run(initial_payload)
+
+                    print("\n" + "="*60)
+                    print(f"✅ 歷史時光機重建完畢 (耗時: {time() - start_time:.2f} 秒)")
+                    print(f"📊 突變/首創模組 (MUTATION): {final_result.stats['mutations']}")
+                    print(f"📊 沿用舊有模組 (INHERITED): {final_result.stats['inherited']}")
+                    print(f"👻 隔離純複製體 (CLONES): {final_result.stats['clones']} 個檔案")
+                    if final_result.stats['failed'] > 0:
+                        print(f"⚠️ 解析失敗隔離 (FAILED): {final_result.stats['failed']} 個檔案")
+                    print(f"📂 本次輸出父夾: {final_result.final_dir}")
+                    print("="*60)
+
     except KeyboardInterrupt:
         print("\n\n🛑 [使用者中斷] 偵測到手動停止 (Ctrl+C)。")
         print("依照 [ADR-001] 原則，已停止執行並保留當前處理進度。")
-        if initial_payload.staging_dir and initial_payload.staging_dir.exists():
+        if initial_payload and initial_payload.staging_dir and initial_payload.staging_dir.exists():
             print(f"📂 斷點進度與報表已保留於: {initial_payload.staging_dir}")
-            
+
     except Exception as e:
         force_rollback(initial_payload)
         print(f"\n💥 【系統架構級嚴重終止】原因: {e}")
-        
+
     finally:
         print("\n")
         os.system('pause' if os.name == 'nt' else 'read -p "Press Enter to continue..."')
